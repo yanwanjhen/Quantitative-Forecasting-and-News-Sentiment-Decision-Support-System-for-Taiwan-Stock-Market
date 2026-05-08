@@ -1,0 +1,20 @@
+{
+  "sessions": {
+    "session_1": [
+      {
+        "id": "7224056db3a84609a0b9d41f0d3f5961",
+        "role": "assistant",
+        "content": "您好！我是您的台股投資顧問，您可以直接輸入標的，例如：「台積電走勢如何？」",
+        "created_at": 1778226371.4937758,
+        "dashboard_data": null
+      }
+    ]
+  },
+  "current_session": "session_1",
+  "session_counter": 1,
+  "investor_profile": {
+    "style": "穩健",
+    "risk_tolerance": "medium",
+    "max_loss_pct": 10
+  }
+}

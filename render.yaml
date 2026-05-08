@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: taiwan-stock-advisor-api
+    env: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install -r requirements-interface-st-bottom.txt
+    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: CORS_ALLOW_ORIGINS
+        value: ""
+      - key: CORS_ALLOW_ORIGIN_REGEX
+        value: "^https://.*\\.vercel\\.app$"
