@@ -15,25 +15,13 @@ except Exception:
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 _request_state = threading.local()
+REQUIRE_USER_API_KEY = os.getenv("REQUIRE_USER_API_KEY", "").strip() in {"1", "true", "True", "yes", "YES"}
 
 SYSTEM_PROMPT = (
     "你是一位專業且謹慎的台股投資顧問。"
     "所有回覆必須使用繁體中文，避免簡體中文。"
     "請以台灣投資人容易理解的語氣回答，並避免保證獲利。"
 )
-
-
-def _get_secret(name):
-    value = os.getenv(name)
-    if value:
-        return value
-    if st is not None:
-        try:
-            return st.secrets.get(name)
-        except Exception:
-            return None
-            return None
-
 
 @contextmanager
 def groq_request_context(api_key=None, model=None):
@@ -85,12 +73,10 @@ class GroqChatModel:
                     api_key = st.session_state["user_api_key"]
             except Exception:
                 pass
-            
+
+        # Enforce user-supplied keys. We intentionally do not read GROQ_API_KEY from env/secrets.
         if not api_key:
-            api_key = _get_secret("GROQ_API_KEY")
-            
-        if not api_key:
-            raise RuntimeError("找不到 GROQ_API_KEY，請在左側欄輸入您的 API Key。")
+            raise RuntimeError("缺少 API Key。請由使用者在前端輸入後再送出請求。")
         return {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

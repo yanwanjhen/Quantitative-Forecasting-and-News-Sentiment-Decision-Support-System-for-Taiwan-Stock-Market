@@ -844,7 +844,7 @@ if user_input:
 
         with st.status("啟動投資顧問分析引擎...", expanded=True) as status:
             import config
-            if not st.session_state.get("user_api_key") and not config._get_secret("GROQ_API_KEY"):
+            if not st.session_state.get("user_api_key"):
                 status.update(label="⚠️ 缺乏 API Key", state="error", expanded=False)
                 st.error("請先於左側欄輸入您的 Groq API Key 以啟用 AI 分析功能！")
                 st.stop()

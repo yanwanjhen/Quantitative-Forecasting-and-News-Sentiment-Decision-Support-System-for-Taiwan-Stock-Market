@@ -28,6 +28,7 @@ Open `http://127.0.0.1:5173`.
 - The Groq API key and advanced model override live in the sidebar API Key panel.
 - Investor style and maximum acceptable loss live in the composer risk panel.
 - Chat history is stored in the existing `data/user_histories` directory.
+- In production, set `REQUIRE_USER_API_KEY=1` on the backend to require every user to supply their own key.
 
 ## Deploy (Vercel + Render)
 

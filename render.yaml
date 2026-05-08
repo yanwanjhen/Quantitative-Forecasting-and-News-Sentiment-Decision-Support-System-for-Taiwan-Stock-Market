@@ -11,3 +11,5 @@ services:
         value: ""
       - key: CORS_ALLOW_ORIGIN_REGEX
         value: "^https://.*\\.vercel\\.app$"
+      - key: REQUIRE_USER_API_KEY
+        value: "1"

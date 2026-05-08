@@ -522,6 +522,11 @@ def stream_message(
     request: StreamMessageRequest,
     x_groq_api_key: Optional[str] = Header(default=None),
 ) -> StreamingResponse:
+    if not x_groq_api_key or not x_groq_api_key.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="缺少 API Key。請先在前端輸入您的 API Key 後再送出訊息。",
+        )
     safe_user_id = _safe_user_id(request.user_id)
     state = _load_state(safe_user_id)
     if session_id not in state.sessions:
