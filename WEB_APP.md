@@ -41,7 +41,7 @@ This repo can be deployed as:
 1. Create a Render "Web Service" from this repo (root directory).
 2. Use the commands from `render.yaml`, or set:
    - Build command: `pip install -r requirements-interface-st-bottom.txt`
-   - Start command: `uvicorn api_server:app --host 0.0.0.0 --port $PORT`
+   - Start command: `sh -c "uvicorn api_server:app --host 0.0.0.0 --port ${PORT}"`
 3. Environment variables (recommended):
    - `CORS_ALLOW_ORIGINS` (optional): comma-separated exact origins
    - `CORS_ALLOW_ORIGIN_REGEX` (optional): origin regex, default matches `https://*.vercel.app`
