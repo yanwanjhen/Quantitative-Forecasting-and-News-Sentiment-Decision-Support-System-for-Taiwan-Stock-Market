@@ -183,6 +183,11 @@ function App() {
     event?.preventDefault();
     const content = (override ?? draft).trim();
     if (!content || !activeSessionId || isStreaming) return;
+    if (!apiKey.trim()) {
+      setLoadError("尚未輸入 API Key，請先在左側欄 API Key 面板輸入後再送出。");
+      setApiKeyPanelOpen(true);
+      return;
+    }
     setFollowUps([]);
     setStatusSteps(["準備分析..."]);
 
