@@ -116,13 +116,13 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def _preload_finbert():
-    """Pre-warm the FinBERT model at startup so the first user query is fast."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, load_finbert_model)
-    print("\u2705 FinBERT \u6a21\u578b\u9810\u71b1\u5b8c\u6210\uff0c\u7cfb\u7d71\u5c31\u7dd2")
+#@app.on_event("startup")
+#async def _preload_finbert():
+    #"""Pre-warm the FinBERT model at startup so the first user query is fast."""
+    #import asyncio
+    #loop = asyncio.get_event_loop()
+    #await loop.run_in_executor(None, load_finbert_model)
+    #print("\u2705 FinBERT \u6a21\u578b\u9810\u71b1\u5b8c\u6210\uff0c\u7cfb\u7d71\u5c31\u7dd2")
 
 
 def _safe_user_id(user_id: Optional[str]) -> str:
