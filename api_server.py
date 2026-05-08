@@ -29,7 +29,7 @@ from data_fetch import (
     generate_user_news_sentiment_answer_stream,
     run_quant_model,
 )
-from sentiment_analysis import load_finbert_model
+#from sentiment_analysis import load_finbert_model
 
 
 APP_DIR = Path(__file__).resolve().parent
