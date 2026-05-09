@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useState, useTransition } from "react";
+import React, { FormEvent, useEffect, useRef, useState, useTransition } from "react";
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -18,7 +18,7 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { checkHealth, createSession, loadSessions, streamMessage, updateProfile } from "./api";
+import { createSession, loadSessions, streamMessage, updateProfile } from "./api";
 import type { ChatMessage, ChatSession, DashboardData, InvestorProfile, StreamEvent } from "./types";
 import "./styles.css";
 
@@ -70,12 +70,8 @@ function App() {
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [toast, setToast] = useState<{ id: number; message: string; tone?: "ok" | "warn" } | null>(null);
-  const [diagStatus, setDiagStatus] = useState<
-    { state: "idle" }
-    | { state: "checking" }
-    | { state: "ok"; model?: string }
-    | { state: "error"; message: string }
-  >({ state: "idle" });
+  const firstStatusTimerRef = useRef<number | null>(null);
+  const hasReceivedStatusRef = useRef(false);
   const [apiKeyCheck, setApiKeyCheck] = useState<
     { state: "idle" } | { state: "ok"; message: string } | { state: "warn"; message: string }
   >({ state: "idle" });
@@ -130,21 +126,18 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    return () => {
+      if (firstStatusTimerRef.current !== null) {
+        window.clearTimeout(firstStatusTimerRef.current);
+      }
+    };
+  }, []);
+
   const activeSession = sessions.find((session) => session.session_id === activeSessionId);
   const messages = activeSession?.messages ?? [];
   const activeTitle = activeSession?.title || appTitle;
   const isConversationStart = !messages.some((message) => message.role === "user");
-
-  async function runConnectionCheck() {
-    setDiagStatus({ state: "checking" });
-    try {
-      const health = await checkHealth();
-      setDiagStatus({ state: "ok", model: health.default_model });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : "Unable to reach backend";
-      setDiagStatus({ state: "error", message: msg });
-    }
-  }
 
   function runApiKeyCheck() {
     const trimmed = apiKey.trim();
@@ -215,6 +208,15 @@ function App() {
     }
     setFollowUps([]);
     setStatusSteps(["準備分析..."]);
+    hasReceivedStatusRef.current = false;
+    if (firstStatusTimerRef.current !== null) {
+      window.clearTimeout(firstStatusTimerRef.current);
+    }
+    firstStatusTimerRef.current = window.setTimeout(() => {
+      if (!hasReceivedStatusRef.current) {
+        setStatusSteps(["後端仍在啟動或分析中，請稍候..."]);
+      }
+    }, 8000);
     const requestStarted = Date.now();
     setStreamStartedAt(requestStarted);
     setClockNow(requestStarted);
@@ -308,6 +310,11 @@ function App() {
               );
             }
             if (streamEvent.event === "status") {
+              hasReceivedStatusRef.current = true;
+              if (firstStatusTimerRef.current !== null) {
+                window.clearTimeout(firstStatusTimerRef.current);
+                firstStatusTimerRef.current = null;
+              }
               setStatusSteps(prev => {
                 const text: string = streamEvent.data.text;
                 const tag = text.match(/^\[\d+\/\d+\]/);
@@ -359,8 +366,13 @@ function App() {
               setIsStreaming(false);
               setStatusSteps([]);
               setStreamStartedAt(null);
+              if (firstStatusTimerRef.current !== null) {
+                window.clearTimeout(firstStatusTimerRef.current);
+                firstStatusTimerRef.current = null;
+              }
             }
             if (streamEvent.event === "error") {
+              setIsStreaming(false);
               liveAssistant = { ...liveAssistant, content: streamEvent.data.message };
               setSessions((current) =>
                 current.map((session) => {
@@ -375,6 +387,10 @@ function App() {
               );
               setStatusSteps([]);
               setStreamStartedAt(null);
+              if (firstStatusTimerRef.current !== null) {
+                window.clearTimeout(firstStatusTimerRef.current);
+                firstStatusTimerRef.current = null;
+              }
             }
           });
         },
@@ -385,6 +401,10 @@ function App() {
       setLoadError("訊息未送達，請確認 FastAPI 後端與 API key 設定後再試一次。");
       setStatusSteps([]);
       setStreamStartedAt(null);
+      if (firstStatusTimerRef.current !== null) {
+        window.clearTimeout(firstStatusTimerRef.current);
+        firstStatusTimerRef.current = null;
+      }
       setSessions((current) =>
         current.map((session) => {
           if (session.session_id !== targetSessionId) return session;
@@ -395,6 +415,10 @@ function App() {
         }),
       );
     } finally {
+      if (firstStatusTimerRef.current !== null) {
+        window.clearTimeout(firstStatusTimerRef.current);
+        firstStatusTimerRef.current = null;
+      }
       setIsStreaming(false);
     }
   }
@@ -533,23 +557,10 @@ function App() {
               <div className="error-banner-body">
                 <div className="error-banner-text">{loadError}</div>
                 <div className="error-actions">
-                  <button type="button" className="error-action" onClick={runConnectionCheck} disabled={diagStatus.state === "checking"}>
-                    {diagStatus.state === "checking" ? "Checking..." : "Check Connection"}
-                  </button>
                   <button type="button" className="error-action" onClick={runApiKeyCheck}>
                     Check API Key
                   </button>
                 </div>
-                {diagStatus.state === "ok" && (
-                  <div className="error-diagnostics ok">
-                    連線正常。後端服務可用。
-                  </div>
-                )}
-                {diagStatus.state === "error" && (
-                  <div className="error-diagnostics warn">
-                    連線失敗：{diagStatus.message}
-                  </div>
-                )}
                 {apiKeyCheck.state !== "idle" && (
                   <div className={`error-diagnostics ${apiKeyCheck.state === "ok" ? "ok" : "warn"}`}>
                     {apiKeyCheck.message}
@@ -829,7 +840,7 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
       <div className="dashboard-section">
         <button className="section-toggle" onClick={() => setExpandNews(n => !n)}>
           <span>情緒新聞清單</span>
-          <strong>{rawNews.length ? `共 ${rawNews.length} 則` : "無資料"} {expandNews ? "▲" : "▼"}</strong>
+          <strong>{formatNewsCount(rawNews.length, news.news_count_status)} {expandNews ? "▲" : "▼"}</strong>
         </button>
         {expandNews && (
           rawNews.length ? (
@@ -1083,7 +1094,7 @@ function toPriceMove(price: unknown, predictedReturn: unknown) {
 }
 
 function formatNewsCount(count: number, status: unknown) {
-  if (count > 0) return String(count);
+  if (count > 0) return `共 ${count} 則`;
   const normalized = String(status ?? "");
   if (normalized === "fetch_failed") return "抓取失敗";
   if (normalized === "few") return "偏少";

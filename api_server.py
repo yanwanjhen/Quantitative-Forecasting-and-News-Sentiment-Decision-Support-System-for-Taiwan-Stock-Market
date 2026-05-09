@@ -4,8 +4,9 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -38,6 +39,27 @@ USER_HISTORY_DIR = APP_DIR / "data" / "user_histories"
 DEFAULT_ASSISTANT_MESSAGE = (
     "您好！我是您的台股投資顧問，您可以直接輸入標的，例如：「台積電走勢如何？」"
 )
+
+T = TypeVar("T")
+
+
+class StepTimeoutError(Exception):
+    def __init__(self, step: str, seconds: int):
+        self.step = step
+        self.seconds = seconds
+        super().__init__(f"{step} timed out after {seconds}s")
+
+
+def _run_with_timeout(step: str, seconds: int, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func, *args, **kwargs)
+    try:
+        return future.result(timeout=seconds)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise StepTimeoutError(step, seconds) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 DEFAULT_PROFILE = {"style": "穩健", "risk_tolerance": "medium", "max_loss_pct": 10}
 RISK_MAP = {"保守": "low", "穩健": "medium", "積極": "high"}
 
@@ -288,15 +310,27 @@ def _merge_stock_mentions(*groups: List[Any]) -> List[Dict[str, str]]:
 def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
     ticker = stock_info.get("ticker")
     company_name = stock_info.get("company_name") or ticker
-    stock_data, df_history = fetch_realtime_stock_data(ticker)
+    try:
+        stock_data, df_history = _run_with_timeout("股價資料抓取", 20, fetch_realtime_stock_data, ticker)
+    except StepTimeoutError:
+        stock_data, df_history = None, None
     resolved_ticker = stock_data.get("resolved_ticker") if stock_data else None
     display_ticker = resolved_ticker or _normalize_ticker(ticker) or ticker
     company_name = resolve_tw_company_name(str(display_ticker or ticker or ""), str(company_name or ""))
-    news_data = fetch_stock_or_macro_sentiment(display_ticker, company_name, days=5)
-    quant_data = run_quant_model(display_ticker, df_history, {
-        "ticker": display_ticker,
-        "company_name": company_name,
-    })
+    try:
+        news_data = _run_with_timeout("新聞抓取", 25, fetch_stock_or_macro_sentiment, display_ticker, company_name, days=5)
+    except StepTimeoutError:
+        news_data = _fallback_news_data("新聞抓取失敗：新聞來源回應逾時，情緒分數先以 0 處理。")
+    if _stock_lookup_failed(display_ticker, stock_data, df_history):
+        quant_data = _fallback_quant_data("行情或歷史資料不足")
+    else:
+        try:
+            quant_data = _run_with_timeout("量化模型", 35, run_quant_model, display_ticker, df_history, {
+                "ticker": display_ticker,
+                "company_name": company_name,
+            })
+        except StepTimeoutError:
+            quant_data = _fallback_quant_data("量化模型回應逾時")
     latest_price = stock_data.get("latest_price", "未知") if stock_data else "未知"
     predicted_return = float(quant_data.get("predicted_return", 0) or 0)
     expected_move = "未知"
@@ -310,7 +344,7 @@ def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
         "預期報酬率": f"{quant_data.get('predicted_return', 0) * 100:.3f}%",
         "預期價差": expected_move,
         "情緒分數": news_data.get("sentiment_score", 0),
-        "5天新聞數": len(news_data.get("raw_news", [])),
+        "5天新聞數": "抓取失敗" if news_data.get("news_count_status") == "fetch_failed" else len(news_data.get("raw_news", [])),
         "市場狀態": quant_data.get("regime", "未知"),
         "近一年最大回撤": quant_data.get("max_dd", "N/A"),
     }
@@ -325,6 +359,64 @@ def _stock_lookup_failed(ticker: Any, stock_data: Optional[Dict[str, Any]], df_h
         return df_history.empty
     # Fallback: if the fetcher returned some history-like object, treat it as success.
     return False
+
+
+def _fallback_news_data(message: str = "新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理。") -> Dict[str, Any]:
+    return {
+        "news_summary": message,
+        "sentiment_score": 0.0,
+        "raw_news": [],
+        "news_count_status": "fetch_failed",
+    }
+
+
+def _fallback_quant_data(reason: str = "量化模型暫時無法完成預測") -> Dict[str, Any]:
+    return {
+        "signal": "無法預測",
+        "predicted_return": 0.0,
+        "predicted_move": "未知",
+        "regime": "無資料",
+        "max_dd": "N/A",
+        "model_name": reason,
+    }
+
+
+def _fallback_intent(question: str, profile: InvestorProfile) -> Dict[str, Any]:
+    mentions = find_stock_mentions(question)
+    if mentions:
+        first = mentions[0]
+        return {
+            "intent_type": "STOCK",
+            "ticker": first.get("ticker"),
+            "company_name": first.get("company_name"),
+            "stocks": mentions,
+            "risk_tolerance": profile.risk_tolerance,
+            "investor_profile": profile.model_dump(),
+        }
+    return {
+        "intent_type": "UNRELATED",
+        "risk_tolerance": profile.risk_tolerance,
+        "investor_profile": profile.model_dump(),
+    }
+
+
+def _friendly_error_message(exc: Exception) -> str:
+    if isinstance(exc, StepTimeoutError):
+        if "新聞" in exc.step:
+            return "新聞抓取失敗：新聞來源回應逾時，請稍後再試。"
+        if "股價" in exc.step or "行情" in exc.step:
+            return "有標的但資料不足：行情來源回應逾時，暫時無法完成分析。"
+        return f"{exc.step}逾時：後端仍在處理或外部服務回應過慢，請稍後再試。"
+    if hasattr(exc, "response") and exc.response is not None and exc.response.status_code == 429:
+        return "API 請求次數過多 (Too Many Requests)，請稍後再試。"
+    if "429 Client Error" in str(exc):
+        return "API 請求次數過多 (Too Many Requests)，請稍後再試。"
+    text = str(exc)
+    if "NoneType" in text or isinstance(exc, TypeError):
+        return "有標的但資料不足：部分資料來源暫時沒有回傳可用內容，請稍後再試。"
+    if "Google News" in text or "RSS" in text or "新聞" in text:
+        return "新聞抓取失敗：目前無法取得近期新聞，請稍後再試。"
+    return "分析時發生錯誤：外部資料來源暫時不穩定，請稍後再試。"
 
 
 def _format_portfolio_table(rows: List[Dict[str, Any]]) -> str:
@@ -363,6 +455,7 @@ def _run_analysis(
     messages.append(user_message)
     state.investor_profile = profile
     _save_state(state)
+    yield _event("status", {"text": "已收到請求，正在啟動分析流程..."})
     yield _event("message", {"message": user_message.model_dump()})
 
     final_reply = ""
@@ -385,7 +478,18 @@ def _run_analysis(
                 )
             else:
                 yield _event("status", {"text": "解析投資意圖與標的..."})
-                intent = extract_intent(user_input, 1, profile.risk_tolerance, [m.model_dump() for m in messages])
+                try:
+                    intent = _run_with_timeout(
+                        "標的與意圖解析",
+                        20,
+                        extract_intent,
+                        user_input,
+                        1,
+                        profile.risk_tolerance,
+                        [m.model_dump() for m in messages],
+                    )
+                except StepTimeoutError:
+                    intent = _fallback_intent(user_input, profile)
                 intent["risk_tolerance"] = profile.risk_tolerance
                 intent["investor_profile"] = profile.model_dump()
 
@@ -442,7 +546,10 @@ def _run_analysis(
 
                         t0 = time.time()
                         yield _event("status", {"text": f"[1/4] 📡 抓取 {company_name}({ticker}) 即時行情..."})
-                        stock_data, df_history = fetch_realtime_stock_data(ticker)
+                        try:
+                            stock_data, df_history = _run_with_timeout("股價資料抓取", 20, fetch_realtime_stock_data, ticker)
+                        except StepTimeoutError:
+                            stock_data, df_history = None, None
                         if stock_data and stock_data.get("resolved_ticker"):
                             ticker = stock_data["resolved_ticker"]
                         company_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
@@ -464,13 +571,19 @@ def _run_analysis(
                             return
 
                         yield _event("status", {"text": f"[2/4] 📰 掃描近期新聞 & 情緒分析... ({round(t1-t0,1)}s)"})
-                        news_data = fetch_stock_or_macro_sentiment(ticker, company_name, days=5)
+                        try:
+                            news_data = _run_with_timeout("新聞抓取", 25, fetch_stock_or_macro_sentiment, ticker, company_name, days=5)
+                        except StepTimeoutError:
+                            news_data = _fallback_news_data("新聞抓取失敗：新聞來源回應逾時，情緒分數先以 0 處理，量化分析仍會繼續。")
                         if news_data.get("news_count_status") == "fetch_failed":
                             yield _event("token", {"text": "新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。\n\n"})
                         t2 = time.time()
 
                         yield _event("status", {"text": f"[3/4] 🤖 量化模型運算中... ({round(t2-t1,1)}s)"})
-                        quant_data = run_quant_model(ticker, df_history, intent)
+                        try:
+                            quant_data = _run_with_timeout("量化模型", 35, run_quant_model, ticker, df_history, intent)
+                        except StepTimeoutError:
+                            quant_data = _fallback_quant_data("量化模型回應逾時")
                         t3 = time.time()
 
                         if ticker not in ["未知", "未知標的", None]:
@@ -508,17 +621,7 @@ def _run_analysis(
         _save_state(state)
         yield _event("done", {"message": assistant_message.model_dump()})
     except Exception as exc:
-        if hasattr(exc, "response") and exc.response is not None and exc.response.status_code == 429:
-            error_message = "API 請求次數過多 (Too Many Requests)，請稍後再試。"
-        elif "429 Client Error" in str(exc):
-            error_message = "API 請求次數過多 (Too Many Requests)，請稍後再試。"
-        else:
-            # 避免直接顯示含有網址的錯誤訊息
-            error_detail = str(exc)
-            if "https://" in error_detail or "http://" in error_detail:
-                import re
-                error_detail = re.sub(r'https?://[^\s]+', '<API Endpoint>', error_detail)
-            error_message = f"分析時發生錯誤：{type(exc).__name__}: {error_detail}"
+        error_message = _friendly_error_message(exc)
         
         assistant_message = ChatMessage(role="assistant", content=error_message)
         messages.append(assistant_message)

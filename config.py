@@ -99,7 +99,7 @@ class GroqChatModel:
                 headers=self._headers(),
                 json=payload,
                 stream=stream,
-                timeout=90,
+                timeout=60,
             )
             
             if response.status_code == 429:

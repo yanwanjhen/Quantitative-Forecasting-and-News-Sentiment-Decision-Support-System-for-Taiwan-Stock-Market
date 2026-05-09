@@ -486,9 +486,15 @@ def generate_financial_term_answer_stream(user_input, investor_profile=None):
 # ==========================================
 # 使用 LLM 進行「情緒污染過濾」
 # ==========================================
-def filter_pure_news_with_rules(company_name, news_list):
+def filter_pure_news_with_rules(company_name, news_list, aliases=None):
     if not news_list or company_name in ["台股", "大盤", "未知"]:
         return news_list
+    entity_terms = [company_name, *(aliases or [])]
+    entity_terms = [
+        str(term).strip()
+        for term in entity_terms
+        if str(term).strip() and not re.fullmatch(r"\d{4,6}", str(term).strip())
+    ]
 
     market_noise = ["台股", "大盤", "盤中", "盤後", "加權", "上市櫃", "三大法人"]
     low_value_noise = [
@@ -504,7 +510,7 @@ def filter_pure_news_with_rules(company_name, news_list):
     for title in news_list:
         core_title = title.rsplit(' - ', 1)[0].strip()
         # Strict: must explicitly mention the target company in the title.
-        if company_name not in core_title:
+        if not any(term in core_title for term in entity_terms):
             continue
         # Drop obvious market-wide noise even if the company name appears.
         if any(word in core_title for word in market_noise):
@@ -519,23 +525,25 @@ def filter_pure_news_with_rules(company_name, news_list):
         filtered.append(title)
     return filtered
 
-def filter_pure_news_with_ai(company_name, news_list):
+def filter_pure_news_with_ai(company_name, news_list, aliases=None):
     if not news_list or company_name in ["台股", "大盤", "未知"]:
         return news_list
     if not USE_AI_NEWS_FILTER:
-        return filter_pure_news_with_rules(company_name, news_list)
+        return filter_pure_news_with_rules(company_name, news_list, aliases)
         
     try:
         refined_news = []
         for batch_start in range(0, min(len(news_list), MAX_SENTIMENT_NEWS), 20):
             batch = news_list[batch_start:batch_start + 20]
             news_text = "\n".join([f"[{i}] {title}" for i, title in enumerate(batch)])
+            alias_text = "、".join(aliases or []) or "無"
             prompt = f"""
             你是一個嚴格的金融新聞守門員與實體情緒拆解專家。使用者目前只想分析【{company_name}】的「獨立情緒」。
+            可接受的可信別名：{alias_text}
             請對以下新聞清單進行「結構化推論 (Chain of Thought)」審查，並判斷是否保留該新聞。
 
             【審查規則】：
-            1. 實體關聯性（嚴格）：如果【{company_name}】沒有出現在標題中，請一律丟棄 (drop)。標題中若只是剛好出現股票代號數字，也不能視為命中。
+            1. 實體關聯性（嚴格）：如果【{company_name}】或可信別名沒有出現在標題中，請一律丟棄 (drop)。標題中若只是剛好出現股票代號數字，也不能視為命中。
             2. 多實體雜訊：如同時出現多檔個股或大盤，原則上丟棄。但若主題明顯聚焦於【{company_name}】，請保留，並在 reason 補充說明。
             3. 低價值資訊：若標題是權證、公司資料、基本資料、個股速覽，或只是商品/衍生性金融商品名稱，即使提到【{company_name}】也要丟棄。
             4. 絕對靜止原則：⚠️ 絕對禁止改寫新聞標題！如判斷為保留 (keep)，必須 100% 輸出原始標題。
@@ -557,7 +565,7 @@ def filter_pure_news_with_ai(company_name, news_list):
         return refined_news
     except Exception as e:
         print(f"⚠️ 過濾與提煉失敗，啟動嚴格字串比對 fallback: {e}")
-        return filter_pure_news_with_rules(company_name, news_list)
+        return filter_pure_news_with_rules(company_name, news_list, aliases)
 
 @ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
@@ -584,25 +592,53 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         search_keyword = company_name
     
     headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+
+    def collect_aliases():
+        if is_macro:
+            return []
+        code = str(ticker or "").upper().replace(".TWO", "").replace(".TW", "")
+        aliases = []
+        for name, (mapped_ticker, canonical_name) in COMMON_TW_STOCKS.items():
+            mapped_code = str(mapped_ticker).upper().replace(".TWO", "").replace(".TW", "")
+            if mapped_code != code:
+                continue
+            candidate = str(name).strip()
+            if not candidate or candidate == company_name or re.fullmatch(r"\d{4,6}", candidate):
+                continue
+            if len(candidate) > 40:
+                continue
+            aliases.append(candidate)
+            if len(aliases) >= 4:
+                break
+        return aliases
+
+    trusted_aliases = collect_aliases()
     
-    def get_google_news(query_str):
+    def get_google_news(query_str, exact=True):
         # 嚴格排除任何討論區、論壇、農場文，確保新聞來源為正規財經新聞
         # 個股：給公司名稱加上雙引號，強制精準搜尋
         # 大盤：採用 OR 擴充（避免 "大盤" 太難搜到真正台股市場新聞）
         if is_macro:
             advanced_query = f'({query_str}) -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
-        else:
+        elif exact:
             advanced_query = f'"{query_str}" -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+        else:
+            advanced_query = f'{query_str} -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
         query = urllib.parse.quote(advanced_query)
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            res.raise_for_status()
-            root = ET.fromstring(res.text)
-            return [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
-        except Exception as e:
-            print(f"❌ Google News 抓取失敗 ({query_str})！: {e}")
-            return None
+        last_error = None
+        for attempt in range(2):
+            try:
+                res = requests.get(url, headers=headers, timeout=10 + attempt * 5)
+                res.raise_for_status()
+                root = ET.fromstring(res.text)
+                return [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    time.sleep(0.5)
+        print(f"❌ Google News 抓取失敗 ({query_str})！: {last_error}")
+        return None
 
     def clean_and_dedup(titles):
         import difflib
@@ -641,8 +677,27 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         return deduped_titles
 
     # 取消過多 print，保持終端機乾淨
-    stock_titles = get_google_news(search_keyword)
-    if stock_titles is None:
+    if is_macro:
+        query_plan = [(search_keyword, False)]
+    else:
+        query_plan = [
+            (company_name, True),
+            (f"{company_name} 股票", False),
+            *[(alias, True) for alias in trusted_aliases],
+        ]
+
+    stock_titles = []
+    had_fetch_success = False
+    for query_text, exact in query_plan:
+        titles = get_google_news(query_text, exact=exact)
+        if titles is None:
+            continue
+        had_fetch_success = True
+        stock_titles.extend(titles)
+        if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
+            break
+
+    if not had_fetch_success:
         return {
             "news_summary": "新聞抓取失敗：目前無法連線或解析 Google News RSS，請稍後重試。",
             "sentiment_score": 0.0,
@@ -652,7 +707,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
     unique_news = clean_and_dedup(stock_titles)
     if not is_macro:
         # Only run strict entity filtering for single-stock queries.
-        unique_news = filter_pure_news_with_ai(company_name, unique_news)
+        unique_news = filter_pure_news_with_ai(company_name, unique_news, trusted_aliases)
     unique_news = unique_news[:MAX_SENTIMENT_NEWS]
     
     # 根據取得的新聞數量決定狀態與總結字首
