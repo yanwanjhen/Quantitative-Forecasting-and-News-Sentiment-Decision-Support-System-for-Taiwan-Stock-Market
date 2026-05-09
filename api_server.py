@@ -212,7 +212,7 @@ def _save_state(state: AppState) -> None:
 def _normalize_ticker(value: Any) -> str:
     if not value:
         return ""
-    return str(value).upper().replace(".TW", "").replace(".TWO", "").strip()
+    return str(value).upper().replace(".TWO", "").replace(".TW", "").strip()
 
 
 def _same_stock_follow_up(question: str, dashboard_data: Optional[Dict[str, Any]]) -> bool:
@@ -242,6 +242,7 @@ def _latest_dashboard(messages: List[ChatMessage]) -> Optional[Dict[str, Any]]:
 
 def _normalize_stock_mentions(stock_mentions: List[Any]) -> List[Dict[str, str]]:
     normalized = []
+    seen = set()
     for stock in stock_mentions:
         if isinstance(stock, dict):
             ticker = stock.get("ticker")
@@ -250,8 +251,20 @@ def _normalize_stock_mentions(stock_mentions: List[Any]) -> List[Dict[str, str]]
             ticker = str(stock)
             company_name = ticker
         if ticker:
+            key = _normalize_ticker(ticker)
+            if key in seen:
+                continue
+            seen.add(key)
             normalized.append({"ticker": ticker, "company_name": company_name})
     return normalized
+
+
+def _merge_stock_mentions(*groups: List[Any]) -> List[Dict[str, str]]:
+    merged: List[Any] = []
+    for group in groups:
+        if group:
+            merged.extend(group)
+    return _normalize_stock_mentions(merged)
 
 
 def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
@@ -266,12 +279,18 @@ def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
         "ticker": display_ticker,
         "company_name": company_name,
     })
+    latest_price = stock_data.get("latest_price", "未知") if stock_data else "未知"
+    predicted_return = float(quant_data.get("predicted_return", 0) or 0)
+    expected_move = "未知"
+    if isinstance(latest_price, (int, float)):
+        expected_move = f"{float(latest_price) * predicted_return:.2f}"
     return {
         "標的": f"{company_name}（{display_ticker}）",
-        "目前價格": stock_data.get("latest_price", "未知") if stock_data else "未知",
+        "目前價格": latest_price,
         "趨勢": stock_data.get("trend_summary", "未知") if stock_data else "未知",
         "量化訊號": quant_data.get("signal", "未知"),
         "預期報酬率": f"{quant_data.get('predicted_return', 0) * 100:.3f}%",
+        "預期價差": expected_move,
         "情緒分數": news_data.get("sentiment_score", 0),
         "5天新聞數": len(news_data.get("raw_news", [])),
         "市場狀態": quant_data.get("regime", "未知"),
@@ -358,7 +377,8 @@ def _run_analysis(
                         generate_user_news_sentiment_answer_stream(user_input, analysis, profile.model_dump())
                     )
                 else:
-                    stock_mentions = _normalize_stock_mentions(intent.get("stocks") or find_stock_mentions(user_input))
+                    rule_mentions = find_stock_mentions(user_input)
+                    stock_mentions = _merge_stock_mentions(intent.get("stocks") or [], rule_mentions)
                     wants_portfolio = len(stock_mentions) > 1 and any(
                         word in user_input for word in ["手上", "現有", "持股", "健檢", "投資組合", "看看", "這些", "這幾檔"]
                     )
@@ -366,14 +386,22 @@ def _run_analysis(
                     wants_compare = not wants_portfolio and len(stock_mentions) >= 2
 
                     if wants_portfolio or wants_compare:
-                        limit = 5 if wants_portfolio else 2
+                        limit = 5
+                        compared_names = "、".join(
+                            f"{item.get('company_name') or item.get('ticker')}（{_normalize_ticker(item.get('ticker'))}）"
+                            for item in stock_mentions[:limit]
+                        )
+                        yield _event("token", {"text": f"目前辨識為：{compared_names}\n\n"})
                         rows = []
+                        yield _event("status", {"text": "[1/4] 🧭 確認比較標的與模式..."})
                         for idx, stock_info in enumerate(stock_mentions[:limit], start=1):
-                            yield _event("status", {"text": f"分析第 {idx} 檔：{stock_info.get('company_name')}..."})
+                            yield _event("status", {"text": f"[2/4] 📊 蒐集第 {idx} 檔資料：{stock_info.get('company_name')}..."})
                             rows.append(_analyze_stock_for_comparison(stock_info))
+                        yield _event("status", {"text": "[3/4] 🧩 彙整比較表與交叉訊號..."})
                         table_md = _format_portfolio_table(rows)
-                        heading = "投資組合/持股健檢結果" if wants_portfolio else "兩檔標的比較"
+                        heading = "投資組合/持股健檢結果" if wants_portfolio else "多檔標的比較"
                         yield _event("token", {"text": f"### {heading}\n\n{table_md}\n\n"})
+                        yield _event("status", {"text": "[4/4] ✍️ 生成比較分析報告..."})
                         analysis = yield from _stream_text(
                             generate_portfolio_analysis_stream(
                                 rows,
@@ -382,7 +410,7 @@ def _run_analysis(
                                 intent_type="PORTFOLIO" if wants_portfolio else "COMPARE",
                             )
                         )
-                        final_reply = f"### {heading}\n\n{table_md}\n\n{analysis}"
+                        final_reply = f"目前辨識為：{compared_names}\n\n### {heading}\n\n{table_md}\n\n{analysis}"
                     else:
                         ticker = intent.get("ticker")
                         company_name = intent.get("company_name", "未知")
@@ -393,11 +421,16 @@ def _run_analysis(
                         if stock_data and stock_data.get("resolved_ticker"):
                             ticker = stock_data["resolved_ticker"]
                         company_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
+                        resolved_label = f"目前辨識為：{company_name}（{_normalize_ticker(ticker)}）"
+                        yield _event("token", {"text": f"{resolved_label}\n\n"})
                         t1 = time.time()
 
                         if _stock_lookup_failed(ticker, stock_data, df_history):
                             normalized = _normalize_ticker(ticker) or str(ticker or "").strip() or "未知"
-                            final_reply = f"查無 {normalized} 對應的台股標的，請確認股票代號或公司名稱後再試。"
+                            if company_name and company_name not in ["未知", normalized]:
+                                final_reply = f"{resolved_label}\n\n有標的但資料不足：{company_name}（{normalized}）目前無法取得足夠歷史股價資料，暫時不能進行量化分析。"
+                            else:
+                                final_reply = f"查無標的：找不到 {normalized} 對應的台股標的，請確認股票代號或公司名稱後再試。"
                             yield _event("token", {"text": final_reply})
                             assistant_message = ChatMessage(role="assistant", content=final_reply)
                             messages.append(assistant_message)
@@ -407,6 +440,8 @@ def _run_analysis(
 
                         yield _event("status", {"text": f"[2/4] 📰 掃描近期新聞 & 情緒分析... ({round(t1-t0,1)}s)"})
                         news_data = fetch_stock_or_macro_sentiment(ticker, company_name, days=5)
+                        if news_data.get("news_count_status") == "fetch_failed":
+                            yield _event("token", {"text": "新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。\n\n"})
                         t2 = time.time()
 
                         yield _event("status", {"text": f"[3/4] 🤖 量化模型運算中... ({round(t2-t1,1)}s)"})
@@ -438,6 +473,10 @@ def _run_analysis(
                                 profile.model_dump(),
                             )
                         )
+                        prefix = resolved_label
+                        if news_data.get("news_count_status") == "fetch_failed":
+                            prefix += "\n\n新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。"
+                        final_reply = f"{prefix}\n\n{final_reply}"
 
         assistant_message = ChatMessage(role="assistant", content=final_reply, dashboard_data=dashboard_payload)
         messages.append(assistant_message)
@@ -504,6 +543,32 @@ def get_session(session_id: str, user_id: str = Query(...)) -> Dict[str, Any]:
     state.current_session = session_id
     _save_state(state)
     return {"session_id": session_id, "messages": [m.model_dump() for m in state.sessions[session_id]]}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, user_id: str = Query(...)) -> Dict[str, Any]:
+    state = _load_state(_safe_user_id(user_id))
+    if session_id not in state.sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    del state.sessions[session_id]
+
+    if not state.sessions:
+        state.session_counter += 1
+        new_session_id = f"session_{state.session_counter}"
+        state.sessions[new_session_id] = [ChatMessage(role="assistant", content="您好！這是一個新的分析對話，請問今天想了解哪一檔股票？")]
+        state.current_session = new_session_id
+    elif state.current_session == session_id:
+        state.current_session = next(reversed(state.sessions.keys()))
+
+    _save_state(state)
+    return {
+        "current_session": state.current_session,
+        "sessions": [
+            SessionSummary(session_id=sid, title=_session_title(messages), messages=messages).model_dump()
+            for sid, messages in state.sessions.items()
+        ],
+    }
 
 
 @app.patch("/api/profile")

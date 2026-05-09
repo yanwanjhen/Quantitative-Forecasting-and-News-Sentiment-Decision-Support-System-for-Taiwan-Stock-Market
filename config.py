@@ -6,11 +6,6 @@ import threading
 from contextlib import contextmanager
 from requests.exceptions import HTTPError
 
-try:
-    import streamlit as st
-except Exception:
-    st = None
-
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -67,12 +62,6 @@ class GroqChatModel:
 
     def _headers(self):
         api_key = getattr(_request_state, "api_key", None)
-        if not api_key and st is not None:
-            try:
-                if "user_api_key" in st.session_state and st.session_state["user_api_key"]:
-                    api_key = st.session_state["user_api_key"]
-            except Exception:
-                pass
 
         # Enforce user-supplied keys. We intentionally do not read GROQ_API_KEY from env/secrets.
         if not api_key:

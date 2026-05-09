@@ -1,7 +1,3 @@
-try:
-    import streamlit as st
-except Exception:
-    st = None
 import torch
 import pandas as pd
 import re
@@ -10,7 +6,16 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 # ==========================================
 # 1. 載入專業中文金融 FinBERT 模型 (對齊原始標註檔案)
 # ==========================================
-_cache_resource = st.cache_resource if st is not None else (lambda func: func)
+def _cache_resource(func):
+    cached = None
+
+    def wrapper():
+        nonlocal cached
+        if cached is None:
+            cached = func()
+        return cached
+
+    return wrapper
 
 
 @_cache_resource
@@ -210,9 +215,9 @@ def get_finbert_continuous_score(text, target_company=None):
     # 計算關鍵字指標：統計正負面詞彙數量
     pos_hits, neg_hits = _keyword_hits(text)
     
-    # 1. 關鍵字分數 (Keyword Score): 使用 Tanh 映射，讓 2-3 個關鍵字就能達到強烈分數
-    #    除以 2.0 代表每多 2 個淨關鍵字，分數會往極端靠近; 負面字權重 1.2 倍
-    keyword_score = torch.tanh(torch.tensor((len(pos_hits) - len(neg_hits) * 1.2) / 2.0)).item() 
+    # 1. 關鍵字分數 (Keyword Score): 提高負面權重，讓風險訊號更容易反映在總分上
+    negative_keyword_weight = 1.45
+    keyword_score = torch.tanh(torch.tensor((len(pos_hits) - len(neg_hits) * negative_keyword_weight) / 2.0)).item()
 
     # 2. 動態權重 (Dynamic Weighting): 依據模型對「中性」的確信度來決定聽誰的
     if p_neu > 0.5:
@@ -223,11 +228,14 @@ def get_finbert_continuous_score(text, target_company=None):
     else:
         # Case B: 模型已有明確多空看法 (Pos/Neg) -> 「模型」權重調高
         # 關鍵字僅作輔助，避免誤導
-        w_model = 0.8
-        w_keyword = 0.2
+        w_model = 0.75
+        w_keyword = 0.25
         
     # 3. 融合計算
     final_score = (base_score * w_model) + (keyword_score * w_keyword)
+
+    if final_score < 0:
+        final_score *= 1.15
 
     # 4. 極端防護 (Safety Net): 若關鍵字訊號極強 (如: 崩盤、漲停)，但合併分數卻中庸
     #    強制拉向關鍵字方向，避免被模型的中性拉回太深

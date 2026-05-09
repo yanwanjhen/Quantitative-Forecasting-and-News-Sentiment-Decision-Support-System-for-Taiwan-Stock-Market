@@ -25,6 +25,18 @@ export async function createSession(userId: string): Promise<{ session_id: strin
   return response.json();
 }
 
+export async function deleteSession(
+  sessionId: string,
+  userId: string,
+): Promise<{ current_session: string; sessions: SessionsResponse["sessions"] }> {
+  const suffix = `?user_id=${encodeURIComponent(userId)}`;
+  const response = await fetch(`${API_BASE}/api/sessions/${sessionId}${suffix}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw new Error("Unable to delete session");
+  return response.json();
+}
+
 export async function updateProfile(userId: string, profile: InvestorProfile): Promise<InvestorProfile> {
   const response = await fetch(`${API_BASE}/api/profile`, {
     method: "PATCH",

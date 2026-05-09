@@ -5,7 +5,10 @@ import remarkGfm from "remark-gfm";
 import {
   Bot,
   CircleAlert,
+  Eye,
+  EyeOff,
   KeyRound,
+  Copy,
   Menu,
   MessageSquarePlus,
   PanelLeftClose,
@@ -55,8 +58,12 @@ function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => !window.matchMedia("(max-width: 900px)").matches);
   const [apiKeyPanelOpen, setApiKeyPanelOpen] = useState(false);
+  const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [profilePanelOpen, setProfilePanelOpen] = useState(false);
   const [followUps, setFollowUps] = useState<string[]>([]);
+  const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  const [toast, setToast] = useState<{ id: number; message: string; tone?: "ok" | "warn" } | null>(null);
   const [diagStatus, setDiagStatus] = useState<
     { state: "idle" }
     | { state: "checking" }
@@ -105,6 +112,18 @@ function App() {
     localStorage.setItem("groq-model", model);
   }, [model]);
 
+  useEffect(() => {
+    if (!isStreaming) return;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [isStreaming]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 1800);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
   const activeSession = sessions.find((session) => session.session_id === activeSessionId);
   const messages = activeSession?.messages ?? [];
   const activeTitle = activeSession?.title || appTitle;
@@ -124,11 +143,11 @@ function App() {
   function runApiKeyCheck() {
     const trimmed = apiKey.trim();
     if (!trimmed) {
-      setApiKeyCheck({ state: "warn", message: "尚未輸入 API Key。請先在左側欄 API Key 面板輸入 gsk_...。" });
+      setApiKeyCheck({ state: "warn", message: "尚未輸入 API Key。請先在左側欄 API Key 面板輸入。" });
       return;
     }
     if (!/^gsk_[A-Za-z0-9_-]{8,}$/.test(trimmed)) {
-      setApiKeyCheck({ state: "warn", message: "API Key 格式看起來不太像 gsk_...，請確認是否貼上完整。" });
+      setApiKeyCheck({ state: "warn", message: "API Key 格式錯誤，請確認是否貼上完整。" });
       return;
     }
     setApiKeyCheck({
@@ -184,12 +203,15 @@ function App() {
     const content = (override ?? draft).trim();
     if (!content || !activeSessionId || isStreaming) return;
     if (!apiKey.trim()) {
-      setLoadError("尚未輸入 API Key，請先在左側欄 API Key 面板輸入後再送出。");
+      setLoadError("尚未輸入 API Key，請先在左側欄 API Key 面板輸入。");
       setApiKeyPanelOpen(true);
       return;
     }
     setFollowUps([]);
     setStatusSteps(["準備分析..."]);
+    const requestStarted = Date.now();
+    setStreamStartedAt(requestStarted);
+    setClockNow(requestStarted);
 
 
     let targetSessionId = activeSessionId;
@@ -313,6 +335,7 @@ function App() {
               });
               setIsStreaming(false);
               setStatusSteps([]);
+              setStreamStartedAt(null);
             }
             if (streamEvent.event === "error") {
               liveAssistant = { ...liveAssistant, content: streamEvent.data.message };
@@ -328,6 +351,7 @@ function App() {
                 }),
               );
               setStatusSteps([]);
+              setStreamStartedAt(null);
             }
           });
         },
@@ -337,6 +361,7 @@ function App() {
       liveAssistant = { ...liveAssistant, content: `送出失敗：${message}` };
       setLoadError("訊息未送達，請確認 FastAPI 後端與 API key 設定後再試一次。");
       setStatusSteps([]);
+      setStreamStartedAt(null);
       setSessions((current) =>
         current.map((session) => {
           if (session.session_id !== targetSessionId) return session;
@@ -360,6 +385,10 @@ function App() {
 
   function normalizeTicker(value: string) {
     return value.trim().toUpperCase();
+  }
+
+  function showToast(message: string, tone: "ok" | "warn" = "ok") {
+    setToast({ id: Date.now(), message, tone });
   }
 
   // followUps is now state, not derived
@@ -404,13 +433,14 @@ function App() {
             .slice()
             .reverse()
             .map((session) => (
-              <button
+              <div
                 className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
                 key={session.session_id}
-                onClick={() => setActiveSessionId(session.session_id)}
               >
-                <span>{session.title}</span>
-              </button>
+                <button className="session-link" onClick={() => setActiveSessionId(session.session_id)}>
+                  <span>{session.title}</span>
+                </button>
+              </div>
             ))}
         </div>
         <div className="sidebar-bottom">
@@ -433,14 +463,18 @@ function App() {
                   <input
                     value={apiKey}
                     onChange={(event) => setApiKey(event.target.value)}
-                    type="password"
+                    type={apiKeyVisible ? "text" : "password"}
                     placeholder="gsk_..."
                   />
+                  <button
+                    type="button"
+                    className="input-visibility-toggle"
+                    onClick={() => setApiKeyVisible((visible) => !visible)}
+                    title={apiKeyVisible ? "隱藏 API Key" : "顯示 API Key"}
+                  >
+                    {apiKeyVisible ? <Eye size={16} /> : <EyeOff size={16} />}
+                  </button>
                 </div>
-              </label>
-              <label>
-                <span>Groq model</span>
-                <input value={model} onChange={(event) => setModel(event.target.value)} />
               </label>
             </section>
           )}
@@ -485,7 +519,7 @@ function App() {
                 </div>
                 {diagStatus.state === "ok" && (
                   <div className="error-diagnostics ok">
-                    連線正常。後端預設模型：{diagStatus.model ?? "未知"}
+                    連線正常。後端服務可用。
                   </div>
                 )}
                 {diagStatus.state === "error" && (
@@ -504,14 +538,24 @@ function App() {
           {isConversationStart && (
             <div className="empty-state">
               <h1>{appTitle}</h1>
-              <p>您可以在下方直接台股投資相關問題，系統會自動為您分析。</p>
+              <p>您可以在下方詢問台股投資相關問題，系統會自動為您分析。</p>
             </div>
           )}
-          {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
+          {messages.map((message, index) => (
+            <MessageBubble
+              key={message.id}
+              message={message}
+              onCopyFeedback={showToast}
+              canCopy={message.role === "assistant" && messages.slice(0, index).some((item) => item.role === "user")}
+            />
+          ))}
           {statusSteps.length > 0 && (
             <div className="status-row">
               <Bot size={16} />
               <span>{statusSteps[statusSteps.length - 1]}</span>
+              <span className="status-timer">
+                {streamStartedAt ? `總耗時 ${formatElapsed(clockNow - streamStartedAt)}` : ""}
+              </span>
             </div>
           )}
         </section>
@@ -519,8 +563,12 @@ function App() {
         <section className="composer-wrap">
           {!!followUps.length && (
             <div className="followups">
-              {followUps.map((question) => (
-                <button key={question} onClick={(event) => handleSubmit(event, question)} disabled={isStreaming}>
+              {followUps.map((question, index) => (
+                <button
+                  key={question}
+                  onClick={(event) => handleSubmit(event, question)}
+                  disabled={isStreaming}
+                >
                   {question}
                 </button>
               ))}
@@ -531,7 +579,7 @@ function App() {
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={handleComposerKeyDown}
-              placeholder="請在此輸入欲分析之台股投資相關問題，開始建立一段新的對話。"
+              placeholder="請在此輸入欲分析之問題，開始建立一段新的對話。"
               rows={1}
               data-testid="chat-composer"
             />
@@ -540,7 +588,7 @@ function App() {
                 {profilePanelOpen && (
                   <section className="profile-panel">
                     <div className="settings-heading">
-                      <strong>投資人風險設定</strong>
+                      <strong>風險設定</strong>
                       <span>
                         {profile.style} / 最大虧損 {profile.max_loss_pct}%
                       </span>
@@ -582,7 +630,7 @@ function App() {
                     setApiKeyPanelOpen(false);
                     setProfilePanelOpen((open) => !open);
                   }}
-                  title="投資人風險設定"
+                  title="風險設定"
                 >
                   <SlidersHorizontal size={16} />
                 </button>
@@ -594,18 +642,53 @@ function App() {
           </form>
           <div className="fine-print">金融市場有不確定性，本分析僅供參考。</div>
         </section>
+        {toast && (
+          <div className={`app-toast ${toast.tone ?? "ok"}`} key={toast.id} role="status" aria-live="polite">
+            {toast.message}
+          </div>
+        )}
       </main>
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
-  const normalized = String(message.content ?? "").replace(/<br\s*\/?\s*>/gi, "\n");
+function MessageBubble({
+  message,
+  onCopyFeedback,
+  canCopy,
+}: {
+  message: ChatMessage;
+  onCopyFeedback: (message: string, tone?: "ok" | "warn") => void;
+  canCopy: boolean;
+}) {
+  const normalized = String(message.content ?? "")
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/^已進入.*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const shouldShowCopy = canCopy && normalized.length > 0;
   return (
     <article className={`message ${message.role}`}>
       <div className="message-body">
         {message.dashboard_data && <Dashboard dashboard={message.dashboard_data} />}
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{normalized}</ReactMarkdown>
+        {shouldShowCopy && (
+          <div className="message-footer">
+            <button
+              type="button"
+              className="copy-summary-button"
+              onClick={() => {
+                void copyMessageContent(normalized)
+                  .then(() => onCopyFeedback("已複製", "ok"))
+                  .catch(() => onCopyFeedback("複製失敗，請再試一次", "warn"));
+              }}
+              title="複製整段回覆"
+            >
+              <Copy size={14} />
+              複製回覆
+            </button>
+          </div>
+        )}
       </div>
     </article>
   );
@@ -633,6 +716,7 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
   const rawNews = asRecordArray(news.raw_news);
   const modelDetails = asRecordArray(quant.model_details);
   const predictedReturn = toPercent(quant.predicted_return, 3);
+  const expectedMove = toPriceMove(stock.latest_price, quant.predicted_return);
   const sentimentScore = formatValue(news.sentiment_score ?? 0);
   const trust = evaluateTrust(quant, news);
   const consistency = evaluateConsistency(quant, news);
@@ -660,7 +744,7 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
       <div className="metric-grid">
         <Metric label="目前價格" value={typeof stock.latest_price === "number" ? stock.latest_price.toFixed(2) : String(stock.latest_price ?? "未知")} />
         <Metric label="量化訊號" value={String(quant.signal ?? "未知")} />
-        <Metric label="預期報酬" value={predictedReturn} />
+        <Metric label="預期報酬" value={expectedMove === "未知" ? predictedReturn : `${predictedReturn} / ${expectedMove}`} />
         <Metric label="情緒分數" value={sentimentScore} />
         <Metric label="市場狀態" value={String(quant.regime ?? "未知")} />
         <Metric label="近一年 Max DD" value={String(quant.max_dd ?? "未知")} />
@@ -732,7 +816,7 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
                   <tr>
                     <th>新聞標題</th>
                     <th>FinBERT分數</th>
-                    <th>模型判斷</th>
+                    <th>情緒標籤</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -798,9 +882,10 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
 }
 
 const metricTooltips: Record<string, string> = {
+  "目前價格": "目前的收盤價。",
   "近一年 Max DD": "過去一年內可能會遇到的最大虧損幅度，衡量下檔風險。",
   "市場狀態": "模型依據波動度計算出的目前市場趨勢。",
-  "預期報酬": "模型基於歷史價量軌跡所預測的未來一段期間報酬。",
+  "預期報酬": "顯示預期報酬的百分比與轉換後的價差。",
   "量化訊號": "基於數據推算出的交易訊號，建議搭配風險控管使用。",
   "情緒分數": "基於LLM過濾與Hybrid FinBERT計算出的分數，正數偏多、負數偏空。",
   "建議可信度": "衡量量化訊號與新聞情緒是否同向，所給出的信心水準。",
@@ -830,9 +915,32 @@ function buildFollowUps(messages: ChatMessage[]) {
 
   const lastUserMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
   const lastDashboard = [...messages].reverse().find((message) => message.dashboard_data)?.dashboard_data;
+  const compareTargets = extractComparisonTargets(lastUserMsg);
+
+  if (compareTargets.length >= 2) {
+    const [first, second] = compareTargets;
+    const group = compareTargets.slice(0, 5).join("、");
+    return [
+      `${group} 當中哪一檔最不適合追高？`,
+      `${first} 和 ${second} 如果只能選一檔，現階段我該優先哪一檔？`,
+      `${group} 如果大盤轉弱，部位該怎麼分配？`
+    ];
+  }
   
   if (!lastDashboard) {
-    if (["比較", "哪個", "選", "vs"].some(kw => lastUserMsg.includes(kw))) {
+    if (FINANCIAL_TERMS.some((kw) => lastUserMsg.includes(kw))) {
+      return [
+        "這個指標如果和量化訊號衝突，應該優先看哪一個？",
+        "這個指標最容易誤判的情境是什麼？",
+        "如果我偏保守，該怎麼把這個指標放進進出場規則？"
+      ];
+    } else if (["如果", "假設", "情境", "套牢", "風險承受", "停損順序"].some((kw) => lastUserMsg.includes(kw))) {
+      return [
+        "如果大盤再跌 5%，我應該先調整哪一種部位？",
+        "以穩健風格來看，這種情境最重要的防守規則是什麼？",
+        "如果想等反彈再處理，至少要先看到哪些訊號？"
+      ];
+    } else if (["比較", "哪個", "選", "vs"].some(kw => lastUserMsg.includes(kw))) {
       return [
         "如果資金有限，這幾檔股票應該優先佈局哪一檔？",
         "這幾檔標的中，哪一檔的下檔風險（回撤）相對可控？",
@@ -884,6 +992,46 @@ function buildFollowUps(messages: ChatMessage[]) {
   }
 }
 
+function extractComparisonTargets(text: string) {
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(/([\u4e00-\u9fffA-Za-z\-]{1,12})\s*[（(](\d{4,6})[)）]/g)) {
+    const label = `${match[1]}（${match[2]}）`;
+    if (!seen.has(label)) {
+      seen.add(label);
+      targets.push(label);
+    }
+  }
+  for (const match of text.matchAll(/[（(]([\u4e00-\u9fffA-Za-z、，,\s]{2,40})[)）]/g)) {
+    const parts = match[1]
+      .split(/[、，,\s]+/)
+      .map((part) => part.trim())
+      .filter((part) => /^[\u4e00-\u9fffA-Za-z-]{2,12}$/.test(part));
+    for (const part of parts) {
+      if (!seen.has(part)) {
+        seen.add(part);
+        targets.push(part);
+      }
+    }
+  }
+  return targets;
+}
+
+async function copyMessageContent(content: string) {
+  const fallback = content.trim();
+  if (!navigator.clipboard?.writeText) {
+    throw new Error("clipboard-unavailable");
+  }
+  await navigator.clipboard.writeText(fallback);
+}
+
+const FINANCIAL_TERMS = ["EPS", "本益比", "PER", "PE", "P/E", "殖利率", "MACD", "KD", "RSI", "ROE", "ROA", "最大回撤"];
+
+function formatElapsed(ms: number) {
+  const totalSeconds = Math.max(0, ms) / 1000;
+  return `${totalSeconds.toFixed(1)}s`;
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => isRecord(item)) : [];
 }
@@ -904,6 +1052,13 @@ function toPercent(value: unknown, digits = 2) {
   return `${(numeric * 100).toFixed(digits)}%`;
 }
 
+function toPriceMove(price: unknown, predictedReturn: unknown) {
+  const numericPrice = Number(price);
+  const numericReturn = Number(predictedReturn);
+  if (!Number.isFinite(numericPrice) || !Number.isFinite(numericReturn)) return "未知";
+  return `${(numericPrice * numericReturn).toFixed(2)}元`;
+}
+
 function evaluateTrust(quant: any, news: any) {
   const signal = String(quant?.signal ?? "觀望");
   const sentimentScore = Number(news?.sentiment_score ?? 0);
@@ -920,7 +1075,7 @@ function evaluateTrust(quant: any, news: any) {
   const aligned = (bullish && bullishSentiment) || (bearish && bearishSentiment);
   const conflicted = (bullish && bearishSentiment) || (bearish && bullishSentiment);
   const weakSignal = ["觀望", "資料過少", "無法預測", "集成失敗", "運算錯誤"].includes(signal);
-  const dataLimited = ["none", "few"].includes(newsStatus);
+  const dataLimited = ["none", "few", "fetch_failed"].includes(newsStatus);
   const highDrawdown = maxDd <= -0.2;
 
   let level = "中";
@@ -933,6 +1088,7 @@ function evaluateTrust(quant: any, news: any) {
     level = "低";
     if (conflicted) reason = "量化訊號與市場情緒分歧。";
     else if (highDrawdown) reason = "近一年回撤偏大，波動風險較高。";
+    else if (newsStatus === "fetch_failed") reason = "新聞抓取失敗，情緒分數暫時不具代表性。";
     else reason = "新聞樣本不足，情緒代表性較弱。";
   } else if (weakSignal) {
     level = "中";
@@ -964,7 +1120,7 @@ function evaluateConsistency(quant: any, news: any): null | {
   const aligned = (bullish && bullishSentiment) || (bearish && bearishSentiment);
   const conflicted = (bullish && bearishSentiment) || (bearish && bullishSentiment);
 
-  const dataLimited = ["none", "few"].includes(newsStatus);
+  const dataLimited = ["none", "few", "fetch_failed"].includes(newsStatus);
   const maxDdStr = String(quant?.max_dd ?? "0%");
   const maxDd = Number(maxDdStr.replace(/[()%]/g, "")) / 100;
   const highDrawdown = Number.isFinite(maxDd) && maxDd <= -0.2;
@@ -974,10 +1130,10 @@ function evaluateConsistency(quant: any, news: any): null | {
   const nextSteps: string[] = [];
   if (conflicted) {
     nextSteps.push("量化與情緒分歧時，先降低倉位或採分批進出，等待訊號一致再加碼。");
-    nextSteps.push("回看最近 3-5 天重大新聞/事件，確認情緒分數是否被單一事件帶偏。");
+    nextSteps.push("回看最近 5 天重大新聞/事件，確認情緒分數是否被單一事件帶偏。");
   }
   if (dataLimited) {
-    nextSteps.push("新聞樣本偏少，建議先把情緒權重降低，或改用較長時間窗再判讀。");
+    nextSteps.push(newsStatus === "fetch_failed" ? "新聞抓取失敗，建議先以量化與價格風險為主，稍後重跑新聞分析。" : "新聞樣本偏少，情緒訊號僅供輔助參考，建議避免過度依賴。");
   }
   if (highDrawdown) {
     nextSteps.push("近一年回撤偏大，建議更嚴格的停損與風險上限（配合你的最大可接受虧損）。");

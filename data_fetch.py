@@ -1,4 +1,3 @@
-import streamlit as st
 import json
 import time
 import requests
@@ -31,6 +30,25 @@ from sentiment_analysis import get_finbert_continuous_score, extract_keywords
 API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
 USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "1") == "1"
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
+MAX_SENTIMENT_NEWS = 30
+_MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
+
+
+def ttl_cache_data(ttl: int = 1800):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            key = (func.__name__, repr(args), repr(sorted(kwargs.items())))
+            now = time.time()
+            cached = _MEMOIZED_CACHE.get(key)
+            if cached and now - cached[0] < ttl:
+                return cached[1]
+            result = func(*args, **kwargs)
+            _MEMOIZED_CACHE[key] = (now, result)
+            return result
+
+        return wrapper
+
+    return decorator
 
 MODEL_FEATURE_SETS = {
     "stock_tech2": [
@@ -141,13 +159,14 @@ def _load_external_tw_stock_map():
     return merged
 
 
-COMMON_TW_STOCKS.update(_load_external_tw_stock_map())
+_external_stock_map = _load_external_tw_stock_map()
+COMMON_TW_STOCKS = {**_external_stock_map, **COMMON_TW_STOCKS}
 
 TW_TICKER_TO_NAME: dict[str, str] = {}
 for _, (ticker, canonical_name) in COMMON_TW_STOCKS.items():
     if ticker and canonical_name:
         TW_TICKER_TO_NAME[str(ticker).upper()] = str(canonical_name)
-        TW_TICKER_TO_NAME[str(ticker).upper().replace(".TW", "").replace(".TWO", "")] = str(canonical_name)
+        TW_TICKER_TO_NAME[str(ticker).upper().replace(".TWO", "").replace(".TW", "")] = str(canonical_name)
 
 
 def resolve_tw_company_name(ticker: str, fallback: str = "") -> str:
@@ -158,7 +177,7 @@ def resolve_tw_company_name(ticker: str, fallback: str = "") -> str:
     t = (ticker or "").strip().upper()
     if not t:
         return fallback or ""
-    code = t.replace(".TW", "").replace(".TWO", "")
+    code = t.replace(".TWO", "").replace(".TW", "")
     # Fast path: code key (e.g. "2312")
     if code in COMMON_TW_STOCKS:
         return COMMON_TW_STOCKS[code][1]
@@ -171,9 +190,9 @@ def resolve_tw_company_name(ticker: str, fallback: str = "") -> str:
 
 
 def sentiment_label_from_score(score: float) -> str:
-    if score > 0.15:
+    if score > 0.12:
         return "正面"
-    if score < -0.15:
+    if score < -0.08:
         return "負面"
     return "中立"
 
@@ -198,34 +217,43 @@ def find_stock_mentions(text):
 
     mentions = []
     seen = set()
+    occupied_ranges: list[tuple[int, int]] = []
 
-    # 1) Company-name mentions, ordered by first appearance in the text
+    def overlaps(existing_ranges, start, end):
+        return any(not (end <= s or start >= e) for s, e in existing_ranges)
+
+    # 1) Company-name mentions, ordered by first appearance and preferring longer matches.
     name_hits = []
     for company_name, (ticker, canonical_name) in COMMON_TW_STOCKS.items():
         pattern = re.escape(company_name)
         flags = re.IGNORECASE if re.search(r"[A-Za-z]", company_name) else 0
-        m = re.search(pattern, text, flags=flags)
-        if m:
-            name_hits.append((m.start(), ticker, canonical_name))
-    for _, ticker, canonical_name in sorted(name_hits, key=lambda x: x[0]):
+        for match in re.finditer(pattern, text, flags=flags):
+            name_hits.append((match.start(), match.end(), len(company_name), ticker, canonical_name))
+    for start, end, _, ticker, canonical_name in sorted(name_hits, key=lambda x: (x[0], -x[2])):
+        if overlaps(occupied_ranges, start, end):
+            continue
         if ticker in seen:
             continue
         mentions.append({"ticker": ticker, "company_name": canonical_name})
         seen.add(ticker)
+        occupied_ranges.append((start, end))
 
-    # 2) Numeric ticker mentions, ordered by appearance; dedupe by ticker
+    # 2) Numeric ticker mentions, ordered by appearance; prefer mapped exchange suffix.
     for match in re.finditer(r"(?<!\d)(\d{4,6})(?:\.(TW|TWO))?(?!\d)", text, re.IGNORECASE):
+        if overlaps(occupied_ranges, match.start(), match.end()):
+            continue
+        code = match.group(1)
         suffix = match.group(2)
-        ticker = f"{match.group(1)}.{suffix.upper()}" if suffix else f"{match.group(1)}.TW"
+        if code in COMMON_TW_STOCKS:
+            ticker, company_name = COMMON_TW_STOCKS[code]
+        else:
+            ticker = f"{code}.{suffix.upper()}" if suffix else f"{code}.TW"
+            company_name = code
         if ticker in seen:
             continue
-        company_name = match.group(1)
-        for _, (known_ticker, known_name) in COMMON_TW_STOCKS.items():
-            if known_ticker == ticker:
-                company_name = known_name
-                break
         mentions.append({"ticker": ticker, "company_name": company_name})
         seen.add(ticker)
+        occupied_ranges.append((match.start(), match.end()))
 
     return mentions
 
@@ -494,7 +522,7 @@ def filter_pure_news_with_ai(company_name, news_list):
         
     try:
         refined_news = []
-        for batch_start in range(0, min(len(news_list), 100), 20):
+        for batch_start in range(0, min(len(news_list), MAX_SENTIMENT_NEWS), 20):
             batch = news_list[batch_start:batch_start + 20]
             news_text = "\n".join([f"[{i}] {title}" for i, title in enumerate(batch)])
             prompt = f"""
@@ -526,7 +554,7 @@ def filter_pure_news_with_ai(company_name, news_list):
         print(f"⚠️ 過濾與提煉失敗，啟動嚴格字串比對 fallback: {e}")
         return filter_pure_news_with_rules(company_name, news_list)
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
     resolved_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
     if resolved_name and not re.fullmatch(r"\d{4,6}", resolved_name):
@@ -540,17 +568,26 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             "news_count_status": "none"
         }
 
-    if not company_name or company_name == '未知':
-        search_keyword = "台股"
+    macro_entities = {"台股", "大盤", "加權指數", "加權"}
+    is_macro = (not company_name) or (company_name == "未知") or (company_name in macro_entities)
+
+    # For macro queries, we intentionally broaden recall and do not use exact quoted match.
+    # For single-stock queries, we keep the strict entity rule (quoted company name).
+    if is_macro:
+        search_keyword = "台股 OR 加權指數 OR 加權"
     else:
-        search_keyword = company_name 
+        search_keyword = company_name
     
     headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
     
     def get_google_news(query_str):
         # 嚴格排除任何討論區、論壇、農場文，確保新聞來源為正規財經新聞
-        # 給公司名稱加上雙引號，強制精準搜尋
-        advanced_query = f'"{query_str}" -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+        # 個股：給公司名稱加上雙引號，強制精準搜尋
+        # 大盤：採用 OR 擴充（避免 "大盤" 太難搜到真正台股市場新聞）
+        if is_macro:
+            advanced_query = f'({query_str}) -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+        else:
+            advanced_query = f'"{query_str}" -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
         query = urllib.parse.quote(advanced_query)
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         try:
@@ -560,7 +597,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             return [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
         except Exception as e:
             print(f"❌ Google News 抓取失敗 ({query_str})！: {e}")
-            return []
+            return None
 
     def clean_and_dedup(titles):
         import difflib
@@ -600,9 +637,18 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
 
     # 取消過多 print，保持終端機乾淨
     stock_titles = get_google_news(search_keyword)
+    if stock_titles is None:
+        return {
+            "news_summary": "新聞抓取失敗：目前無法連線或解析 Google News RSS，請稍後重試。",
+            "sentiment_score": 0.0,
+            "raw_news": [],
+            "news_count_status": "fetch_failed",
+        }
     unique_news = clean_and_dedup(stock_titles)
-    unique_news = filter_pure_news_with_ai(search_keyword, unique_news)
-    unique_news = unique_news[:100]
+    if not is_macro:
+        # Only run strict entity filtering for single-stock queries.
+        unique_news = filter_pure_news_with_ai(company_name, unique_news)
+    unique_news = unique_news[:MAX_SENTIMENT_NEWS]
     
     # 根據取得的新聞數量決定狀態與總結字首
     news_count = len(unique_news)
@@ -618,10 +664,10 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         summary_prefix = f"近期相關新聞較少 (僅 {news_count} 篇)，請以技術面與量化數據為主"
         news_count_status = "few"
     else:
-        summary_prefix = f"抓取【{search_keyword}】專屬純淨新聞"
+        summary_prefix = "抓取【台股/加權指數】市場新聞" if is_macro else f"抓取【{search_keyword}】專屬純淨新聞"
         news_count_status = "sufficient"
 
-    recent_news_titles = unique_news[:100]
+    recent_news_titles = unique_news[:MAX_SENTIMENT_NEWS]
     
     scores = []
     news_details = [] 
@@ -657,34 +703,58 @@ def fetch_realtime_stock_data(ticker):
     try:
         if not ticker or ticker == '未知' or ticker == '未知標的':
             return {"latest_price": "無", "trend_summary": "無資料"}, None
-            
-        yf_ticker = f"{ticker}.TW" if str(ticker).isdigit() else str(ticker).strip()
-        stock = yf.Ticker(yf_ticker)
-        # Fetch 2 years of data to ensure enough history for normalizations and sequences
-        df = stock.history(period="2y")
-        
-        # --- 新增：上市櫃 (.TW / .TWO) 代號容錯切換機制 ---
-        if df.empty:
-            if yf_ticker.endswith('.TW'):
-                yf_ticker = yf_ticker.replace('.TW', '.TWO')
-            elif yf_ticker.endswith('.TWO'):
-                yf_ticker = yf_ticker.replace('.TWO', '.TW')
-            stock = yf.Ticker(yf_ticker)
-            df = stock.history(period="2y")
-            
-        if df.empty: 
+
+        raw = str(ticker).strip().upper()
+        code = raw.replace(".TWO", "").replace(".TW", "")
+        candidates = []
+        if raw == "^TWII":
+            candidates = ["^TWII"]
+        elif code in COMMON_TW_STOCKS:
+            candidates.append(COMMON_TW_STOCKS[code][0].upper())
+        if raw and raw not in candidates:
+            candidates.append(raw)
+        if code and f"{code}.TW" not in candidates:
+            candidates.append(f"{code}.TW")
+        if code and f"{code}.TWO" not in candidates:
+            candidates.append(f"{code}.TWO")
+
+        df = pd.DataFrame()
+        resolved_ticker = raw
+        latest_price = None
+        for candidate in candidates:
+            stock = yf.Ticker(candidate)
+            for period in ["2y", "1y", "6mo", "3mo", "1mo"]:
+                df = stock.history(period=period)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    resolved_ticker = candidate
+                    break
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                break
+            try:
+                fast_info = getattr(stock, "fast_info", None) or {}
+                latest_price = fast_info.get("lastPrice") or fast_info.get("regularMarketPrice")
+            except Exception:
+                latest_price = latest_price
+
+        if df.empty and latest_price is None:
             return {"latest_price": "無", "trend_summary": "無資料"}, None
-            
+
         df = df.dropna(subset=['Close'])
-        if df.empty: 
-            return {"latest_price": "無", "trend_summary": "無資料"}, None
-            
-        latest_price = round(df['Close'].iloc[-1], 2)
+        if df.empty:
+            if latest_price is None:
+                return {"latest_price": "無", "trend_summary": "無資料"}, None
+            return {
+                "latest_price": round(float(latest_price), 2),
+                "trend_summary": "資料不足",
+                "resolved_ticker": resolved_ticker.replace('.TWO', '').replace('.TW', ''),
+            }, None
+
+        latest_price = round(float(df['Close'].iloc[-1]), 2)
         # 取近 20 天均線做為趨勢指標
         ma20 = df['Close'].tail(20).mean()
         trend = "站上月線" if latest_price > ma20 else "跌破月線"
-        
-        return {"latest_price": latest_price, "trend_summary": trend, "resolved_ticker": yf_ticker.replace('.TW', '').replace('.TWO', '')}, df
+
+        return {"latest_price": latest_price, "trend_summary": trend, "resolved_ticker": resolved_ticker.replace('.TWO', '').replace('.TW', '')}, df
     except: return {"latest_price": "未知", "trend_summary": "抓取失敗"}, None
 
 def run_quant_model(ticker, df_history, intent):
@@ -994,8 +1064,9 @@ def extract_intent(user_input, default_horizon, default_risk, chat_history):
         return {"ticker": "未知標的", "company_name": "未知", "horizon": default_horizon, "risk_tolerance": default_risk}
 
 def generate_investment_advice_stream(user_input, intent, quant_data, stock_data, news_data, chat_history, investor_profile=None):
-    pos_headlines = [n['新聞標題'] for n in news_data.get('raw_news', []) if n.get('情緒標籤') == '正面'][:3]
-    neg_headlines = [n['新聞標題'] for n in news_data.get('raw_news', []) if n.get('情緒標籤') == '負面'][:3]
+    raw_news = news_data.get('raw_news') or []
+    pos_headlines = [n['新聞標題'] for n in raw_news if n.get('情緒標籤') == '正面'][:3]
+    neg_headlines = [n['新聞標題'] for n in raw_news if n.get('情緒標籤') == '負面'][:3]
     investor_profile = investor_profile or intent.get("investor_profile", {})
 
     news_status_prompt = ""
@@ -1047,7 +1118,7 @@ def generate_investment_advice_stream(user_input, intent, quant_data, stock_data
 
 **第一步：判斷使用者真正在問什麼**
 
-根據【使用者問題】與【對話背景】，判斷這是以下哪種情況：
+根據【使用者問題】與【對話背景】，判斷這是以下哪種情況(但不用輸出是ABCD的哪一種)：
 
 A) **全新分析**（首次詢問此標的，或問法是「現在怎樣？走勢如何？值得投資嗎？」）
    → 輸出完整三段報告（格式見下方）
@@ -1144,6 +1215,8 @@ def generate_portfolio_analysis_stream(rows, user_input, investor_profile, inten
 ⚠️ 禁止說「視市場情況調整」「需要進一步觀察」等無實質內容的話。
 ⚠️ 每一檔標的都必須被提到至少一次。
 ⚠️ 若情緒與量化訊號矛盾，明確說明哪個指標在此情境下更可信。
+⚠️ 只能根據上方【各標的量化數據】回答，禁止把名稱相似的股票視為同一家公司。
+⚠️ 如果某一檔出現「抓取失敗 / 無法預測 / 無資料」，必須明講該檔目前資料不足，不可硬做排名。
 
 > ⚠️ 本分析基於量化模型與新聞情緒模型，僅供參考，不構成投資建議。
 ⚠️ 禁止輸出任何 HTML 標籤（例如 <br>、<table>、<div>）。只用 Markdown（換行請用空行或 Markdown 語法）
@@ -1153,18 +1226,19 @@ def generate_portfolio_analysis_stream(rows, user_input, investor_profile, inten
 
 
 def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history):
+    dashboard_data = dashboard_data or {}
     ticker = dashboard_data.get("ticker", "未知")
     company_name = dashboard_data.get("company_name", ticker)
-    stock_data = dashboard_data.get("stock_data", {})
-    quant_data = dashboard_data.get("quant_data", {})
-    news_data = dashboard_data.get("news_data", {})
-    investor_profile = dashboard_data.get("investor_profile", {})
-    raw_news = news_data.get("raw_news", [])
+    stock_data = dashboard_data.get("stock_data") or {}
+    quant_data = dashboard_data.get("quant_data") or {}
+    news_data = dashboard_data.get("news_data") or {}
+    investor_profile = dashboard_data.get("investor_profile") or {}
+    raw_news = news_data.get("raw_news") or []
     evidence_headlines = [n.get("新聞標題", "") for n in raw_news[:4] if n.get("新聞標題")]
 
     recent_history = ""
     if chat_history:
-        recent = [m for m in chat_history[-8:] if m.get("role") in ("user", "assistant")]
+        recent = [m for m in chat_history[-8:] if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         recent_history = "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in recent)
 
     prompt = f'''你是一位台股投資顧問，正在與使用者針對「{company_name}（{ticker}）」進行持續對話。
