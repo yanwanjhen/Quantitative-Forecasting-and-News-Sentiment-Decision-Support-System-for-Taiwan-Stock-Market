@@ -12,6 +12,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+import asyncio
 
 import config
 from config import groq_request_context
@@ -29,7 +30,7 @@ from data_fetch import (
     generate_user_news_sentiment_answer_stream,
     run_quant_model,
 )
-#from sentiment_analysis import load_finbert_model
+from sentiment_analysis import warm_finbert_model
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -115,14 +116,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-#@app.on_event("startup")
-#async def _preload_finbert():
-    #"""Pre-warm the FinBERT model at startup so the first user query is fast."""
-    #import asyncio
-    #loop = asyncio.get_event_loop()
-    #await loop.run_in_executor(None, load_finbert_model)
-    #print("\u2705 FinBERT \u6a21\u578b\u9810\u71b1\u5b8c\u6210\uff0c\u7cfb\u7d71\u5c31\u7dd2")
+@app.on_event("startup")
+async def _preload_finbert():
+    """Pre-warm the FinBERT model at startup so the first user query is fast."""
+    try:
+        await asyncio.to_thread(warm_finbert_model)
+        print("FinBERT 模型預熱完成。")
+    except Exception as exc:
+        print(f"FinBERT 預熱失敗，將於首次情緒分析時再嘗試載入：{exc}")
 
 
 def _safe_user_id(user_id: Optional[str]) -> str:

@@ -1,6 +1,7 @@
 import torch
 import pandas as pd
 import re
+import threading
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # ==========================================
@@ -8,11 +9,14 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 # ==========================================
 def _cache_resource(func):
     cached = None
+    cache_lock = threading.Lock()
 
     def wrapper():
         nonlocal cached
         if cached is None:
-            cached = func()
+            with cache_lock:
+                if cached is None:
+                    cached = func()
         return cached
 
     return wrapper
@@ -33,7 +37,22 @@ def load_finbert_model():
         device = torch.device("cpu")
         
     model.to(device)
+    model.eval()
     return tokenizer, model, device
+
+
+def warm_finbert_model():
+    tokenizer, model, device = load_finbert_model()
+    sample = tokenizer(
+        "台積電營收成長，市場情緒偏多。",
+        return_tensors="pt",
+        truncation=True,
+        max_length=64,
+        padding=True,
+    ).to(device)
+    with torch.no_grad():
+        _ = model(**sample)
+    return True
 
 # ==========================================
 # 🚀 擴展情緒詞典與關鍵字萃取 (結合 CSV 台積電與鴻海近期重點字)
