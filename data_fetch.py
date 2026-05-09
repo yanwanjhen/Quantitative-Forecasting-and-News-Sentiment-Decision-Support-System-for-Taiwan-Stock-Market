@@ -26,6 +26,7 @@ from config import model_llm
 API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
 USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "0") == "1"
 ENABLE_QUANT_MODEL = os.getenv("ENABLE_QUANT_MODEL", "0") == "1"
+GOOGLE_NEWS_PROXY_URL = os.getenv("GOOGLE_NEWS_PROXY_URL", "").strip()
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
@@ -739,6 +740,36 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         rss2json_url = "https://api.rss2json.com/v1/api.json?rss_url=" + urllib.parse.quote(url, safe="")
         last_error = None
+
+        if GOOGLE_NEWS_PROXY_URL:
+            try:
+                proxy_res = requests.get(
+                    GOOGLE_NEWS_PROXY_URL,
+                    params={"q": advanced_query, "days": days},
+                    headers=headers,
+                    timeout=8,
+                )
+                proxy_res.raise_for_status()
+                content_type = proxy_res.headers.get("Content-Type", "")
+                text = proxy_res.text.strip()
+                if "json" in content_type.lower() or text.startswith("{"):
+                    payload = proxy_res.json()
+                    if payload.get("status") == "ok":
+                        return [
+                            item.get("title")
+                            for item in payload.get("items", [])
+                            if item.get("title")
+                        ]
+                    last_error = RuntimeError(payload.get("message") or "GAS proxy did not return ok")
+                else:
+                    root = ET.fromstring(proxy_res.text)
+                    titles = [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
+                    if titles:
+                        return titles
+                    last_error = RuntimeError("GAS proxy returned no RSS titles")
+            except Exception as e:
+                last_error = e
+
         for attempt in range(2):
             try:
                 res = requests.get(url, headers=headers, timeout=4 + attempt * 2)
@@ -763,7 +794,8 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             last_error = RuntimeError(payload.get("message") or "RSS2JSON did not return ok")
         except Exception as e:
             last_error = e
-        print(f"❌ Google News 抓取失敗 ({query_str})！: {last_error}")
+        source_label = "GAS proxy / Google News / RSS2JSON"
+        print(f"❌ {source_label} 抓取失敗 ({query_str})！: {last_error}")
         return None
 
     def get_yahoo_news():

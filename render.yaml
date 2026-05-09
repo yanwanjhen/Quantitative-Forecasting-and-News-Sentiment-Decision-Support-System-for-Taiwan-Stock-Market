@@ -19,3 +19,5 @@ services:
         value: "0"
       - key: USE_AI_NEWS_FILTER
         value: "0"
+      - key: GOOGLE_NEWS_PROXY_URL
+        value: ""
