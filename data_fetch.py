@@ -671,6 +671,11 @@ def filter_pure_news_with_ai(company_name, news_list, aliases=None):
 
 @ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
+    if GOOGLE_NEWS_PROXY_URL:
+        print(f"📰 GOOGLE_NEWS_PROXY_URL 已設定：{GOOGLE_NEWS_PROXY_URL[:40]}...")
+    else:
+        print("📰 GOOGLE_NEWS_PROXY_URL 未設定，將使用 Yahoo/RSS2JSON/Google News fallback。")
+
     resolved_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
     if resolved_name and not re.fullmatch(r"\d{4,6}", resolved_name):
         company_name = resolved_name
@@ -881,6 +886,9 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
     if yahoo_titles is not None:
         had_fetch_success = True
         stock_titles.extend(yahoo_titles)
+        print(f"📰 Yahoo RSS 成功：{len(yahoo_titles)} 則")
+    else:
+        print("📰 Yahoo RSS 失敗")
 
     for query_text, exact in query_plan:
         if len(stock_titles) >= MAX_SENTIMENT_NEWS:
@@ -890,10 +898,12 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             continue
         had_fetch_success = True
         stock_titles.extend(titles)
+        print(f"📰 Google/RSS2JSON/GAS 成功：+{len(titles)} 則（query={query_text}）")
         if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
             break
 
     if not had_fetch_success:
+        print("📰 新聞抓取最終失敗：所有來源皆無法連線或解析")
         return {
             "news_summary": "新聞抓取失敗：目前無法連線或解析 Yahoo 股市 RSS / Google News RSS，請稍後重試。",
             "sentiment_score": 0.0,

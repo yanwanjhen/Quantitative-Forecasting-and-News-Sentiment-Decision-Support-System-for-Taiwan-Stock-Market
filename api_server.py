@@ -109,6 +109,11 @@ class ProfileRequest(BaseModel):
 
 app = FastAPI(title="Taiwan Stock Advisor API")
 
+@app.get("/")
+def root() -> Dict[str, str]:
+    # Render 常會打 "/" 做健康檢查；回 200 避免日誌一直刷 404。
+    return {"status": "ok"}
+
 
 def _env_csv(name: str) -> List[str]:
     raw = os.getenv(name, "").strip()
