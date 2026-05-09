@@ -13,6 +13,7 @@ import {
   MessageSquarePlus,
   PanelLeftClose,
   X,
+  Square,
   Send,
   Settings2,
   SlidersHorizontal,
@@ -68,10 +69,12 @@ function App() {
   const [profilePanelOpen, setProfilePanelOpen] = useState(false);
   const [followUps, setFollowUps] = useState<string[]>([]);
   const [streamStartedAt, setStreamStartedAt] = useState<number | null>(null);
+  const [lastElapsedMs, setLastElapsedMs] = useState<number | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [toast, setToast] = useState<{ id: number; message: string; tone?: "ok" | "warn" } | null>(null);
   const firstStatusTimerRef = useRef<number | null>(null);
   const hasReceivedStatusRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [apiKeyCheck, setApiKeyCheck] = useState<
     { state: "idle" } | { state: "ok"; message: string } | { state: "warn"; message: string }
   >({ state: "idle" });
@@ -131,6 +134,7 @@ function App() {
       if (firstStatusTimerRef.current !== null) {
         window.clearTimeout(firstStatusTimerRef.current);
       }
+      abortControllerRef.current?.abort();
     };
   }, []);
 
@@ -207,6 +211,7 @@ function App() {
       return;
     }
     setFollowUps([]);
+    setLastElapsedMs(null);
     setStatusSteps(["準備分析..."]);
     hasReceivedStatusRef.current = false;
     if (firstStatusTimerRef.current !== null) {
@@ -220,6 +225,8 @@ function App() {
     const requestStarted = Date.now();
     setStreamStartedAt(requestStarted);
     setClockNow(requestStarted);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
 
     let targetSessionId = activeSessionId;
@@ -316,7 +323,7 @@ function App() {
                 firstStatusTimerRef.current = null;
               }
               setStatusSteps(prev => {
-                const text: string = streamEvent.data.text;
+                const text = cleanStatusText(streamEvent.data.text);
                 const tag = text.match(/^\[\d+\/\d+\]/);
                 if (tag && prev.length > 0 && prev[prev.length - 1].startsWith(tag[0])) {
                   return [...prev.slice(0, -1), text];
@@ -351,6 +358,7 @@ function App() {
               );
             }
             if (streamEvent.event === "done") {
+              const completedMs = Date.now() - requestStarted;
               setSessions((current) => {
                 const updated = current.map((session) => {
                   if (session.session_id !== targetSessionId) return session;
@@ -366,12 +374,15 @@ function App() {
               setIsStreaming(false);
               setStatusSteps([]);
               setStreamStartedAt(null);
+              setLastElapsedMs(completedMs);
+              abortControllerRef.current = null;
               if (firstStatusTimerRef.current !== null) {
                 window.clearTimeout(firstStatusTimerRef.current);
                 firstStatusTimerRef.current = null;
               }
             }
             if (streamEvent.event === "error") {
+              const completedMs = Date.now() - requestStarted;
               setIsStreaming(false);
               liveAssistant = { ...liveAssistant, content: streamEvent.data.message };
               setSessions((current) =>
@@ -387,6 +398,8 @@ function App() {
               );
               setStatusSteps([]);
               setStreamStartedAt(null);
+              setLastElapsedMs(completedMs);
+              abortControllerRef.current = null;
               if (firstStatusTimerRef.current !== null) {
                 window.clearTimeout(firstStatusTimerRef.current);
                 firstStatusTimerRef.current = null;
@@ -394,13 +407,19 @@ function App() {
             }
           });
         },
+        abortController.signal,
       );
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
       const message = error instanceof Error ? error.message : "Unable to stream message";
       liveAssistant = { ...liveAssistant, content: `送出失敗：${message}` };
       setLoadError("訊息未送達，請確認 FastAPI 後端與 API key 設定後再試一次。");
       setStatusSteps([]);
       setStreamStartedAt(null);
+      setLastElapsedMs(Date.now() - requestStarted);
+      abortControllerRef.current = null;
       if (firstStatusTimerRef.current !== null) {
         window.clearTimeout(firstStatusTimerRef.current);
         firstStatusTimerRef.current = null;
@@ -421,6 +440,31 @@ function App() {
       }
       setIsStreaming(false);
     }
+  }
+
+  function handlePauseStreaming() {
+    if (!isStreaming) return;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    const elapsedMs = streamStartedAt ? Date.now() - streamStartedAt : 0;
+    setSessions((current) =>
+      current.map((session) => {
+        if (session.session_id !== activeSessionId) return session;
+        const next = [...session.messages];
+        for (let index = next.length - 1; index >= 0; index -= 1) {
+          const message = next[index];
+          if (message.role === "assistant" && !message.content.trim() && !message.dashboard_data) {
+            next[index] = { ...message, content: "已暫停分析。" };
+            break;
+          }
+        }
+        return { ...session, messages: next };
+      }),
+    );
+    setLastElapsedMs(elapsedMs);
+    setStatusSteps(["已暫停"]);
+    setStreamStartedAt(null);
+    setIsStreaming(false);
   }
 
   function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -588,8 +632,21 @@ function App() {
               <Bot size={16} />
               <span>{statusSteps[statusSteps.length - 1]}</span>
               <span className="status-timer">
-                {streamStartedAt ? `總耗時 ${formatElapsed(clockNow - streamStartedAt)}` : ""}
+                {streamStartedAt ? formatElapsed(clockNow - streamStartedAt) : lastElapsedMs !== null ? `總耗時 ${formatElapsed(lastElapsedMs)}` : ""}
               </span>
+              {isStreaming && (
+                <button type="button" className="pause-stream-button" onClick={handlePauseStreaming}>
+                  <Square size={14} />
+                  暫停
+                </button>
+              )}
+            </div>
+          )}
+          {!isStreaming && statusSteps.length === 0 && lastElapsedMs !== null && (
+            <div className="status-row status-row-done">
+              <Bot size={16} />
+              <span>已完成</span>
+              <span className="status-timer">總耗時 {formatElapsed(lastElapsedMs)}</span>
             </div>
           )}
         </section>
@@ -1064,6 +1121,14 @@ const FINANCIAL_TERMS = ["EPS", "本益比", "PER", "PE", "P/E", "殖利率", "M
 function formatElapsed(ms: number) {
   const totalSeconds = Math.max(0, ms) / 1000;
   return `${totalSeconds.toFixed(1)}s`;
+}
+
+function cleanStatusText(text: unknown) {
+  return String(text ?? "")
+    .replace(/\s*\([^)]*(?:總耗時|耗時|[0-9.]+s)[^)]*\)/g, "")
+    .replace(/\s*總耗時\s*[0-9.]+s/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {

@@ -80,6 +80,7 @@ class GroqChatModel:
             ],
             "temperature": 0.2,
             "stream": stream,
+            "max_tokens": 1100,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -99,7 +100,7 @@ class GroqChatModel:
                 headers=self._headers(),
                 json=payload,
                 stream=stream,
-                timeout=60,
+                timeout=(8, 30),
             )
             
             if response.status_code == 429:

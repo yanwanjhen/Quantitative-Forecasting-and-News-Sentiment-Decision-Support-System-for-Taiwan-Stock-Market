@@ -15,3 +15,7 @@ services:
         value: "1"
       - key: ENABLE_FINBERT_WARMUP
         value: "0"
+      - key: ENABLE_QUANT_MODEL
+        value: "0"
+      - key: USE_AI_NEWS_FILTER
+        value: "0"

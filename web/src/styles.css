@@ -601,6 +601,26 @@ textarea:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
+.status-row-done {
+  animation: none;
+}
+
+.pause-stream-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding: 4px 8px;
+  color: var(--muted-strong);
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.pause-stream-button:hover {
+  background: var(--panel);
+}
+
 .error-banner {
   display: flex;
   align-items: flex-start;

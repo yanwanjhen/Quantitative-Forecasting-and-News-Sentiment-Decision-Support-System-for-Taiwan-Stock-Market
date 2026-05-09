@@ -47,6 +47,7 @@ export async function streamMessage(
   payload: { user_id: string; content: string; profile: InvestorProfile; model?: string },
   apiKey: string,
   onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages/stream`, {
     method: "POST",
@@ -55,6 +56,7 @@ export async function streamMessage(
       ...(apiKey ? { "X-Groq-API-Key": apiKey } : {}),
     },
     body: JSON.stringify(payload),
+    signal,
   });
   if (!response.ok || !response.body) {
     const text = await response.text();

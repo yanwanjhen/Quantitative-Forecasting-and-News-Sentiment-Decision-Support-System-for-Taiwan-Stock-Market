@@ -24,7 +24,8 @@ if _project_root not in sys.path:
 from config import model_llm
 
 API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
-USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "1") == "1"
+USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "0") == "1"
+ENABLE_QUANT_MODEL = os.getenv("ENABLE_QUANT_MODEL", "0") == "1"
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
@@ -65,6 +66,67 @@ def _safe_sentiment_score(text, target_company=None):
     except Exception as exc:
         print(f"⚠️ FinBERT 不可用，改用關鍵字備援情緒分數：{exc}")
         return _keyword_sentiment_score(text)
+
+
+def _lightweight_quant_fallback(df_history, reason="Render 免費方案暫不載入完整量化模型"):
+    if df_history is None or df_history.empty:
+        return {
+            "predicted_return": 0.0,
+            "signal": "無法預測",
+            "regime": "無資料",
+            "max_dd": "N/A",
+            "model_name": "lightweight_price_fallback",
+            "model_count": 0,
+            "error_message": reason,
+        }
+
+    df = df_history.dropna(subset=["Close"]).copy()
+    if df.empty:
+        return {
+            "predicted_return": 0.0,
+            "signal": "無法預測",
+            "regime": "無資料",
+            "max_dd": "N/A",
+            "model_name": "lightweight_price_fallback",
+            "model_count": 0,
+            "error_message": reason,
+        }
+
+    close = df["Close"].astype(float)
+    latest = float(close.iloc[-1])
+    ma20 = float(close.tail(20).mean()) if len(close) >= 20 else latest
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
+    momentum_20d = float(close.pct_change(20).iloc[-1]) if len(close) > 20 else 0.0
+    avg_ret = max(min(momentum_20d / 20, 0.015), -0.015)
+
+    past_year_close = close.tail(252)
+    rolling_max_1y = past_year_close.expanding().max()
+    drawdowns_1y = (past_year_close - rolling_max_1y) / rolling_max_1y
+    max_dd_1y = float(drawdowns_1y.min()) if not drawdowns_1y.empty else 0.0
+
+    if latest > ma20 > ma60 and avg_ret > 0.002:
+        signal = "買入"
+    elif latest < ma20 and avg_ret < -0.002:
+        signal = "賣出"
+    else:
+        signal = "觀望"
+
+    if max_dd_1y <= -0.25:
+        regime = "趨勢轉弱 (熊市)"
+    elif latest > ma20 > ma60:
+        regime = "強勢偏多"
+    else:
+        regime = "回檔整理"
+
+    return {
+        "predicted_return": avg_ret,
+        "signal": signal,
+        "regime": regime,
+        "max_dd": f"({max_dd_1y*100:.1f}%)",
+        "model_name": "lightweight_price_fallback",
+        "model_count": 0,
+        "error_message": reason,
+    }
 
 
 def ttl_cache_data(ttl: int = 1800):
@@ -361,8 +423,14 @@ def cached_generate_text_stream(namespace, prompt, ttl_seconds=43200):
         return
 
     chunks = []
+    started_at = time.time()
     response = model_llm.generate_content(prompt, stream=True)
     for chunk in response:
+        if time.time() - started_at > 45:
+            if not chunks:
+                raise TimeoutError("LLM 回覆生成逾時")
+            chunks.append("\n\n（分析生成時間較長，以上先提供目前可用重點。）")
+            break
         try:
             if chunk.text:
                 chunks.append(chunk.text)
@@ -624,7 +692,17 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
     else:
         search_keyword = company_name
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
     def collect_aliases():
         if is_macro:
@@ -659,10 +737,11 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             advanced_query = f'{query_str} -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
         query = urllib.parse.quote(advanced_query)
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        rss2json_url = "https://api.rss2json.com/v1/api.json?rss_url=" + urllib.parse.quote(url, safe="")
         last_error = None
         for attempt in range(2):
             try:
-                res = requests.get(url, headers=headers, timeout=10 + attempt * 5)
+                res = requests.get(url, headers=headers, timeout=4 + attempt * 2)
                 res.raise_for_status()
                 root = ET.fromstring(res.text)
                 return [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
@@ -670,6 +749,20 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
                 last_error = e
                 if attempt == 0:
                     time.sleep(0.5)
+
+        try:
+            proxy_res = requests.get(rss2json_url, headers=headers, timeout=8)
+            proxy_res.raise_for_status()
+            payload = proxy_res.json()
+            if payload.get("status") == "ok":
+                return [
+                    item.get("title")
+                    for item in payload.get("items", [])
+                    if item.get("title")
+                ]
+            last_error = RuntimeError(payload.get("message") or "RSS2JSON did not return ok")
+        except Exception as e:
+            last_error = e
         print(f"❌ Google News 抓取失敗 ({query_str})！: {last_error}")
         return None
 
@@ -677,7 +770,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         code = str(ticker or "").upper().replace(".TWO", "").replace(".TW", "")
         url = "https://tw.stock.yahoo.com/rss?category=tw-market" if is_macro else f"https://tw.stock.yahoo.com/rss?s={code}"
         try:
-            res = requests.get(url, headers=headers, timeout=12)
+            res = requests.get(url, headers=headers, timeout=6)
             res.raise_for_status()
             root = ET.fromstring(res.text)
         except Exception as e:
@@ -751,7 +844,15 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
 
     stock_titles = []
     had_fetch_success = False
+
+    yahoo_titles = get_yahoo_news()
+    if yahoo_titles is not None:
+        had_fetch_success = True
+        stock_titles.extend(yahoo_titles)
+
     for query_text, exact in query_plan:
+        if len(stock_titles) >= MAX_SENTIMENT_NEWS:
+            break
         titles = get_google_news(query_text, exact=exact)
         if titles is None:
             continue
@@ -760,14 +861,9 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
             break
 
-    yahoo_titles = get_yahoo_news()
-    if yahoo_titles is not None:
-        had_fetch_success = True
-        stock_titles.extend(yahoo_titles)
-
     if not had_fetch_success:
         return {
-            "news_summary": "新聞抓取失敗：目前無法連線或解析 Google News RSS，請稍後重試。",
+            "news_summary": "新聞抓取失敗：目前無法連線或解析 Yahoo 股市 RSS / Google News RSS，請稍後重試。",
             "sentiment_score": 0.0,
             "raw_news": [],
             "news_count_status": "fetch_failed",
@@ -923,6 +1019,9 @@ def run_quant_model(ticker, df_history, intent):
             "model_count": 0,
             "error_message": "df_history 為空，無法執行量化模型。",
         }
+
+    if not ENABLE_QUANT_MODEL:
+        return _lightweight_quant_fallback(df_history)
 
     # 移除尚未開盤導致的 NaN 收盤價
     df = df_history.dropna(subset=['Close']).copy()

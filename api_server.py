@@ -600,7 +600,7 @@ def _run_analysis(
                             yield _event("done", {"message": assistant_message.model_dump()})
                             return
 
-                        yield _event("status", {"text": f"[2/4] 📰 掃描近期新聞 & 情緒分析... ({round(t1-t0,1)}s)"})
+                        yield _event("status", {"text": "[2/4] 📰 掃描近期新聞 & 情緒分析..."})
                         try:
                             news_data = _run_with_timeout("新聞抓取", 25, fetch_stock_or_macro_sentiment, ticker, company_name, days=5)
                         except StepTimeoutError:
@@ -609,7 +609,7 @@ def _run_analysis(
                             yield _event("token", {"text": "新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。\n\n"})
                         t2 = time.time()
 
-                        yield _event("status", {"text": f"[3/4] 🤖 量化模型運算中... ({round(t2-t1,1)}s)"})
+                        yield _event("status", {"text": "[3/4] 🤖 量化模型運算中..."})
                         try:
                             quant_data = _run_with_timeout("量化模型", 35, run_quant_model, ticker, df_history, intent)
                         except StepTimeoutError:
@@ -629,7 +629,7 @@ def _run_analysis(
                             })
                             yield _event("dashboard", {"dashboard_data": dashboard_payload})
 
-                        yield _event("status", {"text": f"[4/4] ✍️ 生成分析報告... ({round(t3-t2,1)}s · 總耗時 {round(t3-t0,1)}s)"})
+                        yield _event("status", {"text": "[4/4] ✍️ 生成分析報告..."})
                         final_reply = yield from _stream_text(
                             generate_investment_advice_stream(
                                 user_input,
