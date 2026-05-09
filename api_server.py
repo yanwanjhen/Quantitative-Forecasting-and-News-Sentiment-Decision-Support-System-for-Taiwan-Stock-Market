@@ -240,6 +240,23 @@ def _latest_dashboard(messages: List[ChatMessage]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _latest_user_message(messages: List[ChatMessage]) -> str:
+    for message in reversed(messages):
+        if message.role == "user" and message.content.strip():
+            return message.content.strip()
+    return ""
+
+
+def _looks_like_fresh_analysis(question: str) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    return any(
+        keyword in text
+        for keyword in ["分析", "現在", "位階", "適合", "可以買", "值得買", "走勢", "進場", "幫我看", "想關注"]
+    )
+
+
 def _normalize_stock_mentions(stock_mentions: List[Any]) -> List[Dict[str, str]]:
     normalized = []
     seen = set()
@@ -353,7 +370,14 @@ def _run_analysis(
     try:
         with groq_request_context(api_key=api_key, model=model):
             previous_dashboard = _latest_dashboard(messages[:-1])
-            if previous_dashboard and _same_stock_follow_up(user_input, previous_dashboard):
+            previous_user_message = _latest_user_message(messages[:-1])
+            is_repeat_question = previous_user_message == user_input.strip()
+            if (
+                previous_dashboard
+                and _same_stock_follow_up(user_input, previous_dashboard)
+                and not is_repeat_question
+                and not _looks_like_fresh_analysis(user_input)
+            ):
                 yield _event("status", {"text": "沿用上一份分析資料回答延伸問題..."})
                 final_reply = yield from _stream_text(
                     generate_follow_up_answer_stream(user_input, previous_dashboard, [m.model_dump() for m in messages])

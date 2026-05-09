@@ -11,6 +11,7 @@ import sys
 import os
 import hashlib
 import re
+from copy import deepcopy
 
 from pathlib import Path
 
@@ -41,10 +42,14 @@ def ttl_cache_data(ttl: int = 1800):
             now = time.time()
             cached = _MEMOIZED_CACHE.get(key)
             if cached and now - cached[0] < ttl:
-                return cached[1]
+                return deepcopy(cached[1])
             result = func(*args, **kwargs)
-            _MEMOIZED_CACHE[key] = (now, result)
-            return result
+            should_cache = True
+            if isinstance(result, dict) and result.get("news_count_status") == "fetch_failed":
+                should_cache = False
+            if should_cache:
+                _MEMOIZED_CACHE[key] = (now, deepcopy(result))
+            return deepcopy(result)
 
         return wrapper
 
@@ -721,11 +726,38 @@ def fetch_realtime_stock_data(ticker):
         df = pd.DataFrame()
         resolved_ticker = raw
         latest_price = None
+        def normalize_history_frame(frame):
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return pd.DataFrame()
+            normalized = frame.copy()
+            if isinstance(normalized.columns, pd.MultiIndex):
+                normalized.columns = [
+                    col[0] if isinstance(col, tuple) and len(col) > 0 else str(col)
+                    for col in normalized.columns
+                ]
+            for required in ["Open", "High", "Low", "Close"]:
+                if required not in normalized.columns:
+                    return pd.DataFrame()
+            return normalized
+
         for candidate in candidates:
             stock = yf.Ticker(candidate)
             for period in ["2y", "1y", "6mo", "3mo", "1mo"]:
-                df = stock.history(period=period)
-                if isinstance(df, pd.DataFrame) and not df.empty:
+                try:
+                    df = normalize_history_frame(stock.history(period=period, auto_adjust=False))
+                except Exception:
+                    df = pd.DataFrame()
+                if not df.empty:
+                    resolved_ticker = candidate
+                    break
+                try:
+                    download_df = normalize_history_frame(
+                        yf.download(candidate, period=period, progress=False, auto_adjust=False, threads=False)
+                    )
+                except Exception:
+                    download_df = pd.DataFrame()
+                if not download_df.empty:
+                    df = download_df
                     resolved_ticker = candidate
                     break
             if isinstance(df, pd.DataFrame) and not df.empty:
@@ -739,7 +771,7 @@ def fetch_realtime_stock_data(ticker):
         if df.empty and latest_price is None:
             return {"latest_price": "無", "trend_summary": "無資料"}, None
 
-        df = df.dropna(subset=['Close'])
+        df = normalize_history_frame(df).dropna(subset=['Close'])
         if df.empty:
             if latest_price is None:
                 return {"latest_price": "無", "trend_summary": "無資料"}, None

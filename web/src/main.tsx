@@ -47,8 +47,14 @@ function getLocalUserId() {
 
 function App() {
   const [userId, setUserId] = useState(getLocalUserId);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState("");
+  const [sessions, setSessions] = useState<ChatSession[]>([
+    {
+      session_id: "local-session",
+      title: "新對話",
+      messages: [],
+    },
+  ]);
+  const [activeSessionId, setActiveSessionId] = useState("local-session");
   const [profile, setProfile] = useState<InvestorProfile>(defaultProfile);
   const [apiKey, setApiKey] = useState(sessionStorage.getItem("groq-api-key") ?? "");
   const [model, setModel] = useState(localStorage.getItem("groq-model") ?? "openai/gpt-oss-20b");
@@ -201,7 +207,7 @@ function App() {
   async function handleSubmit(event?: FormEvent, override?: string) {
     event?.preventDefault();
     const content = (override ?? draft).trim();
-    if (!content || !activeSessionId || isStreaming) return;
+    if (!content || isStreaming) return;
     if (!apiKey.trim()) {
       setLoadError("尚未輸入 API Key，請先在左側欄 API Key 面板輸入。");
       setApiKeyPanelOpen(true);
@@ -215,23 +221,18 @@ function App() {
 
 
     let targetSessionId = activeSessionId;
-    if (activeSessionId.startsWith("local")) {
-      try {
-        const created = await createSession(userId);
-        targetSessionId = created.session_id;
-        setActiveSessionId(created.session_id);
-        setSessions((current) =>
-          current.map((session) =>
-            session.session_id === activeSessionId
-              ? { session_id: created.session_id, title: "新對話", messages: created.messages }
-              : session,
-          ),
-        );
-      } catch {
-        targetSessionId = activeSessionId;
-      }
+    if (!targetSessionId) {
+      targetSessionId = `local-${crypto.randomUUID()}`;
+      setSessions((current) => [
+        ...current,
+        {
+          session_id: targetSessionId,
+          title: "新對話",
+          messages: [],
+        },
+      ]);
+      setActiveSessionId(targetSessionId);
     }
-
     setDraft("");
     setIsStreaming(true);
     setLoadError("");
@@ -250,17 +251,39 @@ function App() {
       content: "",
       created_at: Date.now() / 1000,
     };
-      setSessions((current) =>
-        current.map((session) =>
-          session.session_id === targetSessionId
-            ? {
-                ...session,
+
+    setSessions((current) =>
+      current.map((session) =>
+        session.session_id === targetSessionId
+          ? {
+              ...session,
               title: session.title === "新對話" ? content.slice(0, sessionTitleMaxLen) : session.title,
               messages: [...session.messages, optimisticUser, liveAssistant],
             }
           : session,
-        ),
-      );
+      ),
+    );
+
+    if (targetSessionId.startsWith("local")) {
+      try {
+        const created = await createSession(userId);
+        const previousLocalId = targetSessionId;
+        targetSessionId = created.session_id;
+        setActiveSessionId(created.session_id);
+        setSessions((current) =>
+          current.map((session) =>
+            session.session_id === previousLocalId
+              ? {
+                  ...session,
+                  session_id: created.session_id,
+                }
+              : session,
+          ),
+        );
+      } catch {
+        targetSessionId = activeSessionId || targetSessionId;
+      }
+    }
 
     try {
       await streamMessage(
@@ -698,9 +721,9 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
   const [expandNews, setExpandNews] = useState(false);
   const [expandQuant, setExpandQuant] = useState(false);
   const [chartRange, setChartRange] = useState<"1M" | "3M" | "1Y">("3M");
-  const quant = dashboard.quant_data;
-  const news = dashboard.news_data;
-  const stock = dashboard.stock_data;
+  const quant = dashboard.quant_data ?? {};
+  const news = dashboard.news_data ?? {};
+  const stock = dashboard.stock_data ?? {};
   const allChartData = (dashboard.chart_data ?? []).map((d: Record<string, unknown>) => ({
     date: String(d.date ?? "").slice(0, 10),
     close: Number(d.Close ?? 0),
@@ -749,7 +772,7 @@ function Dashboard({ dashboard }: { dashboard: DashboardData }) {
         <Metric label="市場狀態" value={String(quant.regime ?? "未知")} />
         <Metric label="近一年 Max DD" value={String(quant.max_dd ?? "未知")} />
         <Metric label="建議可信度" value={trust.level} />
-        <Metric label="新聞數量" value={String(rawNews.length || news.news_count_status || "未知")} />
+        <Metric label="新聞數量" value={formatNewsCount(rawNews.length, news.news_count_status)} />
       </div>
       {consistency && (
         <div className={`consistency-card ${consistency.severity}`}>
@@ -1057,6 +1080,15 @@ function toPriceMove(price: unknown, predictedReturn: unknown) {
   const numericReturn = Number(predictedReturn);
   if (!Number.isFinite(numericPrice) || !Number.isFinite(numericReturn)) return "未知";
   return `${(numericPrice * numericReturn).toFixed(2)}元`;
+}
+
+function formatNewsCount(count: number, status: unknown) {
+  if (count > 0) return String(count);
+  const normalized = String(status ?? "");
+  if (normalized === "fetch_failed") return "抓取失敗";
+  if (normalized === "few") return "偏少";
+  if (normalized === "none") return "無新聞";
+  return "未知";
 }
 
 function evaluateTrust(quant: any, news: any) {
