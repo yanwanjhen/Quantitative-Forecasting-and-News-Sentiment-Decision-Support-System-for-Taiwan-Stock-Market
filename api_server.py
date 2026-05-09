@@ -31,7 +31,6 @@ from data_fetch import (
     generate_user_news_sentiment_answer_stream,
     run_quant_model,
 )
-from sentiment_analysis import warm_finbert_model
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -147,6 +146,8 @@ async def _preload_finbert():
         print("FinBERT 預熱已停用（ENABLE_FINBERT_WARMUP!=1）。")
         return
     try:
+        from sentiment_analysis import warm_finbert_model
+
         await asyncio.to_thread(warm_finbert_model)
         print("FinBERT 模型預熱完成。")
     except Exception as exc:
@@ -439,12 +440,36 @@ def _event(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
+def sanitize_assistant_text(text: str) -> str:
+    if not text:
+        return ""
+    blocked_patterns = [
+        r"情況\s*[A-DＡ-Ｄ]",
+        r"Case\s*[A-D]",
+        r"intent_type",
+        r"問題.{0,12}(類型|分類|模式)",
+        r"(類型|分類|模式).{0,12}問題",
+        r"這是.{0,12}(類型|分類|模式)",
+        r"屬於.{0,12}(類型|分類|模式)",
+    ]
+    kept_lines = []
+    for line in str(text).splitlines():
+        if any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in blocked_patterns):
+            continue
+        kept_lines.append(line)
+    cleaned = "\n".join(kept_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 def _stream_text(stream: Generator[str, None, None]) -> Generator[str, None, str]:
-    chunks = []
+    chunks: List[str] = []
     for chunk in stream:
         chunks.append(chunk)
-        yield _event("token", {"text": chunk})
-    return "".join(chunks)
+    text = sanitize_assistant_text("".join(chunks))
+    for start in range(0, len(text), 600):
+        yield _event("token", {"text": text[start:start + 600]})
+    return text
 
 
 def _run_analysis(

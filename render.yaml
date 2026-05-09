@@ -13,3 +13,5 @@ services:
         value: "^https://.*\\.vercel\\.app$"
       - key: REQUIRE_USER_API_KEY
         value: "1"
+      - key: ENABLE_FINBERT_WARMUP
+        value: "0"

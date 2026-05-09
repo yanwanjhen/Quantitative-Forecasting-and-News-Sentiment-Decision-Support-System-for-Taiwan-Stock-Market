@@ -6,11 +6,12 @@ import xml.etree.ElementTree as ET
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import torch
 import sys
 import os
 import hashlib
 import re
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from copy import deepcopy
 
 from pathlib import Path
@@ -20,19 +21,50 @@ _project_root = os.path.dirname(os.path.abspath(__file__))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from experiments.config import get_config
-from experiments.feature_engineering import FeatureEngineer
-from experiments.models import RegimeEmbeddingLSTM
-from experiments.data_processing import DataLoader
-
 from config import model_llm
-from sentiment_analysis import get_finbert_continuous_score, extract_keywords
 
 API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
 USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "1") == "1"
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
+
+
+def _load_quant_dependencies():
+    import torch
+    from experiments.config import get_config
+    from experiments.feature_engineering import FeatureEngineer
+    from experiments.models import RegimeEmbeddingLSTM
+
+    return torch, get_config, FeatureEngineer, RegimeEmbeddingLSTM
+
+
+def _safe_extract_keywords(text):
+    try:
+        from sentiment_analysis import extract_keywords
+
+        return extract_keywords(text)
+    except Exception:
+        hits_pos, hits_neg = _keyword_hits(str(text or ""))
+        return "、".join(hits_pos), "、".join(hits_neg)
+
+
+def _keyword_sentiment_score(text):
+    pos_hits, neg_hits = _keyword_hits(str(text or ""))
+    if not pos_hits and not neg_hits:
+        return 0.0
+    raw = (len(pos_hits) - len(neg_hits) * 1.45) / 2.0
+    return float(np.tanh(raw))
+
+
+def _safe_sentiment_score(text, target_company=None):
+    try:
+        from sentiment_analysis import get_finbert_continuous_score
+
+        return get_finbert_continuous_score(text, target_company=target_company)
+    except Exception as exc:
+        print(f"⚠️ FinBERT 不可用，改用關鍵字備援情緒分數：{exc}")
+        return _keyword_sentiment_score(text)
 
 
 def ttl_cache_data(ttl: int = 1800):
@@ -387,8 +419,8 @@ def analyze_user_provided_news(user_input, target_company=None):
     scores = []
     for idx, item in enumerate(raw_items[:8], start=1):
         clean_text = re.sub(r"\s+", " ", item).strip()
-        score = get_finbert_continuous_score(clean_text, target_company=target_company)
-        pos_hits, neg_hits = extract_keywords(clean_text)
+        score = _safe_sentiment_score(clean_text, target_company=target_company)
+        pos_hits, neg_hits = _safe_extract_keywords(clean_text)
         if score >= 0.2:
             label = "偏多（利多）"
         elif score <= -0.2:
@@ -460,11 +492,12 @@ def generate_financial_term_answer_stream(user_input, investor_profile=None):
 
 ━━━ 回覆準則 ━━━
 
-**第一步：判斷問題類型**
-- 如果是問單一名詞（如「RSI 是什麼？」）→ 完整解釋這個詞
-- 如果是問多個名詞的關係（如「RSI 和 MACD 有什麼差別？」）→ 比較兩者並說明何時用哪個
-- 如果是問如何在實際投資中應用（如「RSI 高於 70 要怎麼做？」）→ 給出具體操作指引
-- 如果問題包含使用者的具體情境（如「我買的股票 RSI 已經 80 了怎辦？」）→ 先回應情境，再解釋概念
+**第一步：理解使用者真正想問什麼**
+- 問單一名詞（如「RSI 是什麼？」）時，完整解釋這個詞。
+- 問多個名詞的關係（如「RSI 和 MACD 有什麼差別？」）時，比較兩者並說明何時用哪個。
+- 問如何在實際投資中應用（如「RSI 高於 70 要怎麼做？」）時，給出具體操作指引。
+- 問題包含使用者的具體投資背景時，先回應背景，再解釋概念。
+- 禁止說明你如何判斷問題，也禁止輸出任何內部分類字眼。
 
 **第二步：輸出回覆**
 
@@ -640,6 +673,36 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         print(f"❌ Google News 抓取失敗 ({query_str})！: {last_error}")
         return None
 
+    def get_yahoo_news():
+        code = str(ticker or "").upper().replace(".TWO", "").replace(".TW", "")
+        url = "https://tw.stock.yahoo.com/rss?category=tw-market" if is_macro else f"https://tw.stock.yahoo.com/rss?s={code}"
+        try:
+            res = requests.get(url, headers=headers, timeout=12)
+            res.raise_for_status()
+            root = ET.fromstring(res.text)
+        except Exception as e:
+            print(f"❌ Yahoo 股市 RSS 抓取失敗 ({code or 'market'})！: {e}")
+            return None
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        titles = []
+        for item in root.findall(".//item"):
+            title = item.findtext("title")
+            if not title:
+                continue
+            pub_date = item.findtext("pubDate")
+            if pub_date:
+                try:
+                    parsed = parsedate_to_datetime(pub_date)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    if parsed < cutoff:
+                        continue
+                except Exception:
+                    pass
+            titles.append(title)
+        return titles
+
     def clean_and_dedup(titles):
         import difflib
         deduped_titles = []
@@ -697,6 +760,11 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
             break
 
+    yahoo_titles = get_yahoo_news()
+    if yahoo_titles is not None:
+        had_fetch_success = True
+        stock_titles.extend(yahoo_titles)
+
     if not had_fetch_success:
         return {
             "news_summary": "新聞抓取失敗：目前無法連線或解析 Google News RSS，請稍後重試。",
@@ -738,7 +806,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         
         # 修正：傳入公司名稱，讓分數只對應該公司的段落
         # "南亞科漲停打開、旺宏亮綠燈" -> 只算 "旺宏亮綠燈"
-        score = get_finbert_continuous_score(clean_title, target_company=company_name)
+        score = _safe_sentiment_score(clean_title, target_company=company_name)
         
         scores.append(score)
         news_details.append({
@@ -874,6 +942,7 @@ def run_quant_model(ticker, df_history, intent):
         }
         
     try:
+        torch, get_config, FeatureEngineer, RegimeEmbeddingLSTM = _load_quant_dependencies()
         config = get_config()
         engineer = FeatureEngineer(config)
         
@@ -1203,25 +1272,15 @@ def generate_investment_advice_stream(user_input, intent, quant_data, stock_data
 
 【你的回覆準則】
 
-**第一步：判斷使用者真正在問什麼**
+請先理解使用者真正想解決的投資問題，再選擇合適的回覆深度：
+- 若是首次分析或問整體走勢，輸出完整三段報告。
+- 若是針對已分析標的的具體追問，直接回答問題，3~6 句即可，不要重寫完整報告。
+- 若是概念或指標解釋，先用白話說明，再連回當前數據。
+- 若是買賣決策確認，給出有立場的條件式建議。
 
-根據【使用者問題】與【對話背景】，判斷這是以下哪種情況(但不用輸出是ABCD的哪一種)：
+絕對禁止提到你如何分類問題，也禁止輸出任何內部分類字眼。
 
-A) **全新分析**（首次詢問此標的，或問法是「現在怎樣？走勢如何？值得投資嗎？」）
-   → 輸出完整三段報告（格式見下方）
-
-B) **具體追問**（針對已分析過的標的，問特定操作問題，如「停損設哪裡？」「適合加碼嗎？」「這訊號準嗎？」）
-   → 直接、精準回答這個問題，**絕對不要重寫完整報告**，3~6句話即可，但必須有根據
-
-C) **概念解釋**（問到某個指標/術語的意思，如「這個 Regime 是什麼意思？」「最大回撤怎麼看？」）
-   → 先用白話解釋這個詞，加一個生活比喻，再說明在當前數據下如何解讀
-
-D) **決策確認**（問「要買嗎？」「現在是好時機嗎？」）
-   → 給出有立場的建議，說清楚「在什麼條件下買，在什麼條件下等」，不要模稜兩可
-
----
-
-**情況 A 的完整報告格式：**
+**完整報告格式：**
 
 ### 📌 一句話診斷
 [用一句話說明這檔股票現在的投資位階與核心結論，要有態度，不要廢話]
@@ -1240,7 +1299,7 @@ D) **決策確認**（問「要買嗎？」「現在是好時機嗎？」）
 ---
 注意事項：
 - 若情緒與量化訊號互相矛盾，必須明確說明哪個更值得信賴，以及理由
-- 禁止在情況 B/C/D 中輸出三段完整報告
+- 使用者問具體追問、概念解釋或決策確認時，不要輸出完整三段報告
 - 禁止在量化數值解釋中說「受新聞情緒驅動」，量化模型純粹基於歷史價量
 - 若使用者提到具體技術指標（如 RSI、MACD），必須結合當前數值解釋，若無數值請說明
 - 語氣像一位有立場的朋友，不像一個免責的機器人
@@ -1348,7 +1407,7 @@ def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history):
 
 ━━━ 回覆準則 ━━━
 
-根據使用者的問題類型，選擇對應的回覆方式：
+根據使用者真正想解決的投資問題，選擇合適的回覆深度：
 
 **操作型問題**（停損怎設？該加碼嗎？何時進場？）
 → 給出有數字、有條件的具體建議。例如：「目前回撤 X%，以你的最大虧損 Y% 來看，建議停損設在 Z 元」
@@ -1364,6 +1423,7 @@ def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history):
 
 **注意**：
 - 這是追問，**絕對不要重寫完整分析報告**
+- 禁止說明你如何判斷問題，也禁止輸出任何內部分類字眼。
 - 長度依問題複雜度調整：簡單問題 2~3 句，複雜問題可到 6~8 句
 - 若問題涉及使用者沒問到的面向，不要主動展開，聚焦在他的問題上
 - 結尾加一句簡短風險提醒即可

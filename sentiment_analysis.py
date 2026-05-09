@@ -1,4 +1,3 @@
-import torch
 import pandas as pd
 import re
 import threading
@@ -24,6 +23,7 @@ def _cache_resource(func):
 @_cache_resource
 def load_finbert_model():
     # Lazy import to keep base memory low on small hosts (e.g. Render free tier).
+    import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
     model_name = "yiyanghkust/finbert-tone-chinese"
@@ -44,6 +44,8 @@ def load_finbert_model():
 
 
 def warm_finbert_model():
+    import torch
+
     tokenizer, model, device = load_finbert_model()
     sample = tokenizer(
         "台積電營收成長，市場情緒偏多。",
@@ -167,6 +169,8 @@ def extract_keywords(text):
 # 2. 情緒連續分數計算 
 # ==========================================
 def get_finbert_continuous_score(text, target_company=None):
+    import torch
+
     if pd.isna(text) or not isinstance(text, str) or text.strip() == "":
         return 0.0
 
