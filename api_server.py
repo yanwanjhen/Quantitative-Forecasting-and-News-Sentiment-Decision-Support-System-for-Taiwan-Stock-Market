@@ -140,7 +140,12 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _preload_finbert():
-    """Pre-warm the FinBERT model at startup so the first user query is fast."""
+    """Optional: pre-warm the FinBERT model at startup for faster first query."""
+    # Render free-tier instances (512MB) can OOM if we eagerly load FinBERT at startup.
+    # Keep warmup opt-in via env var.
+    if os.getenv("ENABLE_FINBERT_WARMUP", "0") != "1":
+        print("FinBERT 預熱已停用（ENABLE_FINBERT_WARMUP!=1）。")
+        return
     try:
         await asyncio.to_thread(warm_finbert_model)
         print("FinBERT 模型預熱完成。")

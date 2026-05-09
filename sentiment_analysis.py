@@ -2,7 +2,6 @@ import torch
 import pandas as pd
 import re
 import threading
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # ==========================================
 # 1. 載入專業中文金融 FinBERT 模型 (對齊原始標註檔案)
@@ -24,6 +23,9 @@ def _cache_resource(func):
 
 @_cache_resource
 def load_finbert_model():
+    # Lazy import to keep base memory low on small hosts (e.g. Render free tier).
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
     model_name = "yiyanghkust/finbert-tone-chinese"
     print(f"🧠 正在載入專業金融 FinBERT 模型 ({model_name}) ...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
