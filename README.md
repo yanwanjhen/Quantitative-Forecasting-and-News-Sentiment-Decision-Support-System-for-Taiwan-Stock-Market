@@ -48,20 +48,9 @@ FastAPI health check:
 curl http://127.0.0.1:8000/api/health
 ```
 
-## Deployment
-
-### Render
-
-- Build command: `pip install -r requirements.txt`
-- Start command: `sh -c "uvicorn api_server:app --host 0.0.0.0 --port ${PORT}"`
-
-### Vercel
-
-- Build source: `web/`
-- Required env var: `VITE_API_BASE=<your-render-backend-url>`
-
 ## Notes
 
 - Every user must provide their own API key through the frontend sidebar.
 - The frontend sends that key in `X-Groq-API-Key` for each request.
 - Investor profile and chat history are managed by the React + FastAPI app only.
+- This project is currently configured for local execution only.

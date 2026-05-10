@@ -23,6 +23,7 @@ from data_fetch import (
     fetch_realtime_stock_data,
     fetch_stock_or_macro_sentiment,
     find_stock_mentions,
+    FINANCIAL_TERMS,
     generate_financial_term_answer_stream,
     generate_follow_up_answer_stream,
     generate_investment_advice_stream,
@@ -111,7 +112,6 @@ app = FastAPI(title="Taiwan Stock Advisor API")
 
 @app.get("/")
 def root() -> Dict[str, str]:
-    # Render 常會打 "/" 做健康檢查；回 200 避免日誌一直刷 404。
     return {"status": "ok"}
 
 
@@ -131,12 +131,12 @@ _default_dev_origins = [
 ]
 
 cors_allow_origins = _env_csv("CORS_ALLOW_ORIGINS") or _default_dev_origins
-cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or r"^https://.*\.vercel\.app$"
+local_cors_regex = r"^http://(localhost|127\.0\.0\.1):[0-9]+$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins,
-    allow_origin_regex=cors_allow_origin_regex,
+    allow_origin_regex=local_cors_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -144,12 +144,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _preload_finbert():
-    """Optional: pre-warm the FinBERT model at startup for faster first query."""
-    # Render free-tier instances (512MB) can OOM if we eagerly load FinBERT at startup.
-    # Keep warmup opt-in via env var.
-    if os.getenv("ENABLE_FINBERT_WARMUP", "0") != "1":
-        print("FinBERT 預熱已停用（ENABLE_FINBERT_WARMUP!=1）。")
-        return
+    """Pre-warm the FinBERT model for the local-only app."""
     try:
         from sentiment_analysis import warm_finbert_model
 
@@ -285,10 +280,148 @@ def _looks_like_fresh_analysis(question: str) -> bool:
     text = (question or "").strip()
     if not text:
         return False
-    return any(
-        keyword in text
-        for keyword in ["分析", "現在", "位階", "適合", "可以買", "值得買", "走勢", "進場", "幫我看", "想關注"]
-    )
+    # "Fresh analysis" should be used only when the user explicitly mentions a target.
+    has_explicit_target = bool(find_stock_mentions(text) or re.search(r"(?<!\d)\d{4,6}(?!\d)", text))
+    if not has_explicit_target:
+        return False
+    return any(keyword in text for keyword in ["分析", "現在", "位階", "適合", "可以買", "值得買", "走勢", "進場", "幫我看", "想關注"])
+
+
+def _looks_like_context_follow_up(question: str, dashboard_data: Optional[Dict[str, Any]]) -> bool:
+    """
+    Treat questions like "這篇新聞會影響你剛剛的建議嗎？" as follow-ups to the latest dashboard,
+    even if the user doesn't repeat the company name/ticker.
+    """
+    if not dashboard_data:
+        return False
+    text = (question or "").strip()
+    if not text:
+        return False
+
+    # If the user explicitly mentions a *different* target, do not treat as follow-up.
+    mentions = find_stock_mentions(text) or []
+    numeric_codes = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", text)
+    prev_ticker = _normalize_ticker(dashboard_data.get("ticker"))
+    prev_company = str(dashboard_data.get("company_name", "") or "")
+    prev_company = prev_company if prev_company not in ["未知", "大盤"] else ""
+
+    # Any explicit mention of a different ticker => new query.
+    if numeric_codes:
+        return prev_ticker in numeric_codes and len(set(numeric_codes)) == 1
+    if mentions:
+        # If user mentions any stock name/ticker not matching previous, treat as new query.
+        for m in mentions:
+            t = _normalize_ticker(m.get("ticker"))
+            n = str(m.get("company_name") or "")
+            if t and prev_ticker and t != prev_ticker:
+                return False
+            if n and prev_company and n != prev_company:
+                return False
+        return True
+
+    followup_triggers = [
+        "這篇",
+        "剛剛",
+        "你剛剛",
+        "剛才",
+        "會有影響嗎",
+        "會影響嗎",
+        "這對",
+        "那這樣",
+        "建議",
+        "進場",
+        "停損",
+        "外資",
+        "庫存",
+        "提款",
+        "修正",
+        "壓力",
+        "利空",
+        "利多",
+        "新聞",
+    ]
+    if any(t in text for t in followup_triggers):
+        return True
+    # Financial term follow-up without a target: tie back to the previous dashboard.
+    if any(term.lower() in text.lower() for term in FINANCIAL_TERMS):
+        return True
+    return False
+
+
+def _compare_rank_markdown(rows: List[Dict[str, Any]]) -> str:
+    """
+    Deterministic post-table recommendation so compare results always include a clear suggestion.
+    Rules:
+      - signal: 買入 > 觀望 > 賣出 > 無法預測/未知
+      - then predicted return (higher better)
+      - then max drawdown (smaller absolute better)
+      - data-insufficient goes to a separate section
+    """
+    if not rows:
+        return ""
+
+    def parse_signal(value: Any) -> int:
+        s = str(value or "")
+        if "買入" in s:
+            return 3
+        if "觀望" in s:
+            return 2
+        if "賣出" in s:
+            return 1
+        return 0
+
+    def parse_pct(value: Any) -> float:
+        s = str(value or "").strip()
+        m = re.search(r"-?\\d+(?:\\.\\d+)?", s)
+        return float(m.group(0)) if m else 0.0
+
+    def parse_dd_abs(value: Any) -> float:
+        s = str(value or "")
+        m = re.search(r"-?\\d+(?:\\.\\d+)?", s)
+        if not m:
+            return 999.0
+        return abs(float(m.group(0)))
+
+    def label(row: Dict[str, Any]) -> str:
+        return str(row.get("標的") or "")
+
+    ranked = []
+    insufficient = []
+    for row in rows:
+        sig = str(row.get("量化訊號") or "")
+        if "抓取失敗" in sig or "無法預測" in sig or "無資料" in sig:
+            insufficient.append(row)
+            continue
+        ranked.append(
+            (
+                parse_signal(sig),
+                parse_pct(row.get("預期報酬率")),
+                -parse_dd_abs(row.get("近一年最大回撤")),
+                row,
+            )
+        )
+
+    ranked.sort(reverse=True, key=lambda x: (x[0], x[1], x[2]))
+    picks = [t[3] for t in ranked]
+
+    lines: List[str] = []
+    if picks:
+        primary = label(picks[0])
+        secondary = label(picks[1]) if len(picks) > 1 else ""
+        avoid = label(picks[-1]) if len(picks) > 2 else ""
+        lines.append("### 建議（依量化訊號優先）")
+        lines.append(f"- 首選：{primary}")
+        if secondary:
+            lines.append(f"- 次選：{secondary}")
+        if avoid and avoid not in [primary, secondary]:
+            lines.append(f"- 相對保守：{avoid}")
+        lines.append("- 配置建議：以首選為主、次選為輔，資料不足者暫不納入核心配置。")
+    if insufficient:
+        lines.append("")
+        lines.append("### 資料不足/暫不排名")
+        for row in insufficient:
+            lines.append(f"- {label(row)}：目前資料不足或抓取失敗")
+    return "\n".join(lines).strip()
 
 
 def _normalize_stock_mentions(stock_mentions: List[Any]) -> List[Dict[str, str]]:
@@ -332,6 +465,8 @@ def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
         news_data = _run_with_timeout("新聞抓取", 25, fetch_stock_or_macro_sentiment, display_ticker, company_name, days=5)
     except StepTimeoutError:
         news_data = _fallback_news_data("新聞抓取失敗：新聞來源回應逾時，情緒分數先以 0 處理。")
+    except Exception:
+        news_data = _fallback_news_data("新聞抓取失敗：本地新聞來源暫時無法取得，情緒分數先以 0 處理。")
     if _stock_lookup_failed(display_ticker, stock_data, df_history):
         quant_data = _fallback_quant_data("行情或歷史資料不足")
     else:
@@ -342,6 +477,8 @@ def _analyze_stock_for_comparison(stock_info: Dict[str, str]) -> Dict[str, Any]:
             })
         except StepTimeoutError:
             quant_data = _fallback_quant_data("量化模型回應逾時")
+        except Exception:
+            quant_data = _fallback_quant_data("本地量化模型載入失敗")
     latest_price = stock_data.get("latest_price", "未知") if stock_data else "未知"
     predicted_return = float(quant_data.get("predicted_return", 0) or 0)
     expected_move = "未知"
@@ -417,7 +554,7 @@ def _friendly_error_message(exc: Exception) -> str:
             return "新聞抓取失敗：新聞來源回應逾時，請稍後再試。"
         if "股價" in exc.step or "行情" in exc.step:
             return "有標的但資料不足：行情來源回應逾時，暫時無法完成分析。"
-        return f"{exc.step}逾時：後端仍在處理或外部服務回應過慢，請稍後再試。"
+        return f"{exc.step}逾時：本地後端仍在處理或資料來源回應過慢，請稍後再試。"
     if hasattr(exc, "response") and exc.response is not None and exc.response.status_code == 429:
         return "API 請求次數過多 (Too Many Requests)，請稍後再試。"
     if "429 Client Error" in str(exc):
@@ -427,7 +564,7 @@ def _friendly_error_message(exc: Exception) -> str:
         return "有標的但資料不足：部分資料來源暫時沒有回傳可用內容，請稍後再試。"
     if "Google News" in text or "RSS" in text or "新聞" in text:
         return "新聞抓取失敗：目前無法取得近期新聞，請稍後再試。"
-    return "分析時發生錯誤：外部資料來源暫時不穩定，請稍後再試。"
+    return "分析時發生錯誤：本地資料來源暫時不穩定，請稍後再試。"
 
 
 def _format_portfolio_table(rows: List[Dict[str, Any]]) -> str:
@@ -503,13 +640,18 @@ def _run_analysis(
             is_repeat_question = previous_user_message == user_input.strip()
             if (
                 previous_dashboard
-                and _same_stock_follow_up(user_input, previous_dashboard)
+                and (_same_stock_follow_up(user_input, previous_dashboard) or _looks_like_context_follow_up(user_input, previous_dashboard))
                 and not is_repeat_question
                 and not _looks_like_fresh_analysis(user_input)
             ):
                 yield _event("status", {"text": "沿用上一份分析資料回答延伸問題..."})
                 final_reply = yield from _stream_text(
-                    generate_follow_up_answer_stream(user_input, previous_dashboard, [m.model_dump() for m in messages])
+                    generate_follow_up_answer_stream(
+                        user_input,
+                        previous_dashboard,
+                        [m.model_dump() for m in messages],
+                        user_news_snippet=user_input if _looks_like_context_follow_up(user_input, previous_dashboard) else None,
+                    )
                 )
             else:
                 yield _event("status", {"text": "解析投資意圖與標的..."})
@@ -532,8 +674,20 @@ def _run_analysis(
                     final_reply = "不好意思，請輸入與投資有關的問題喔！我是專注於台股量化與情緒分析的 AI 投資顧問。"
                     yield _event("token", {"text": final_reply})
                 elif intent.get("intent_type") == "FINANCIAL_TERM":
-                    yield _event("status", {"text": "辨識為金融術語說明..."})
-                    final_reply = yield from _stream_text(generate_financial_term_answer_stream(user_input, profile.model_dump()))
+                    # If there is a previous dashboard and the user didn't specify a new target,
+                    # treat this as a term/question follow-up tied to the previous analysis.
+                    if previous_dashboard and not find_stock_mentions(user_input) and not re.search(r"(?<!\\d)\\d{4,6}(?!\\d)", user_input):
+                        yield _event("status", {"text": "沿用上一份分析資料解釋金融術語..."})
+                        final_reply = yield from _stream_text(
+                            generate_follow_up_answer_stream(
+                                user_input,
+                                previous_dashboard,
+                                [m.model_dump() for m in messages],
+                            )
+                        )
+                    else:
+                        yield _event("status", {"text": "辨識為金融術語說明..."})
+                        final_reply = yield from _stream_text(generate_financial_term_answer_stream(user_input, profile.model_dump()))
                 elif intent.get("intent_type") == "USER_NEWS":
                     yield _event("status", {"text": "分析使用者提供的新聞情緒..."})
                     analysis = analyze_user_provided_news(user_input)
@@ -566,15 +720,23 @@ def _run_analysis(
                         heading = "投資組合/持股健檢結果" if wants_portfolio else "多檔標的比較"
                         yield _event("token", {"text": f"### {heading}\n\n{table_md}\n\n"})
                         yield _event("status", {"text": "[4/4] ✍️ 生成比較分析報告..."})
-                        analysis = yield from _stream_text(
-                            generate_portfolio_analysis_stream(
-                                rows,
-                                user_input,
-                                profile.model_dump(),
-                                intent_type="PORTFOLIO" if wants_portfolio else "COMPARE",
+                        analysis_text = ""
+                        try:
+                            analysis_text = yield from _stream_text(
+                                generate_portfolio_analysis_stream(
+                                    rows,
+                                    user_input,
+                                    profile.model_dump(),
+                                    intent_type="PORTFOLIO" if wants_portfolio else "COMPARE",
+                                )
                             )
-                        )
-                        final_reply = f"目前辨識為：{compared_names}\n\n### {heading}\n\n{table_md}\n\n{analysis}"
+                        except Exception:
+                            analysis_text = ""
+                        rec_md = _compare_rank_markdown(rows)
+                        if analysis_text:
+                            final_reply = f"目前辨識為：{compared_names}\n\n### {heading}\n\n{table_md}\n\n{analysis_text}\n\n{rec_md}".strip()
+                        else:
+                            final_reply = f"目前辨識為：{compared_names}\n\n### {heading}\n\n{table_md}\n\n{rec_md}".strip()
                     else:
                         ticker = intent.get("ticker")
                         company_name = intent.get("company_name", "未知")
@@ -610,6 +772,9 @@ def _run_analysis(
                             news_data = _run_with_timeout("新聞抓取", 25, fetch_stock_or_macro_sentiment, ticker, company_name, days=5)
                         except StepTimeoutError:
                             news_data = _fallback_news_data("新聞抓取失敗：新聞來源回應逾時，情緒分數先以 0 處理，量化分析仍會繼續。")
+                        except Exception:
+                            # Never abort the whole stream for news failures.
+                            news_data = _fallback_news_data("新聞抓取失敗：本地新聞來源暫時無法取得，情緒分數先以 0 處理，量化分析仍會繼續。")
                         if news_data.get("news_count_status") == "fetch_failed":
                             yield _event("token", {"text": "新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。\n\n"})
                         t2 = time.time()
@@ -619,6 +784,8 @@ def _run_analysis(
                             quant_data = _run_with_timeout("量化模型", 35, run_quant_model, ticker, df_history, intent)
                         except StepTimeoutError:
                             quant_data = _fallback_quant_data("量化模型回應逾時")
+                        except Exception:
+                            quant_data = _fallback_quant_data("本地量化模型載入失敗")
                         t3 = time.time()
 
                         if ticker not in ["未知", "未知標的", None]:

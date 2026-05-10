@@ -1,0 +1,4 @@
+__pycache__/
+data/user_histories/*.json
+data/api_cache.json
+

@@ -27,13 +27,8 @@ API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip() == "1"
 
-def _env_str(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
 USE_AI_NEWS_FILTER = _env_flag("USE_AI_NEWS_FILTER", "0")
-ENABLE_QUANT_MODEL = _env_flag("ENABLE_QUANT_MODEL", "0")
-# NOTE: read per-call in fetch_stock_or_macro_sentiment to avoid stale values across deploys.
-GOOGLE_NEWS_PROXY_URL = _env_str("GOOGLE_NEWS_PROXY_URL", "")
+ENABLE_QUANT_MODEL = _env_flag("ENABLE_QUANT_MODEL", "1")
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
@@ -68,9 +63,6 @@ def _keyword_sentiment_score(text):
 
 def _safe_sentiment_score(text, target_company=None):
     try:
-        # Render 512MB plan: do not even attempt to import FinBERT unless explicitly enabled.
-        if not _env_flag("ENABLE_FINBERT", "0"):
-            raise RuntimeError("FinBERT disabled")
         from sentiment_analysis import get_finbert_continuous_score
 
         return get_finbert_continuous_score(text, target_company=target_company)
@@ -79,7 +71,7 @@ def _safe_sentiment_score(text, target_company=None):
         return _keyword_sentiment_score(text)
 
 
-def _lightweight_quant_fallback(df_history, reason="Render 免費方案暫不載入完整量化模型"):
+def _lightweight_quant_fallback(df_history, reason="本地量化模型載入失敗，暫用價格趨勢備援"):
     if df_history is None or df_history.empty:
         return {
             "predicted_return": 0.0,
@@ -681,11 +673,7 @@ def filter_pure_news_with_ai(company_name, news_list, aliases=None):
 
 @ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
-    proxy_url = _env_str("GOOGLE_NEWS_PROXY_URL", "")
-    if proxy_url:
-        print(f"📰 GOOGLE_NEWS_PROXY_URL 已設定：{proxy_url[:40]}...")
-    else:
-        print("📰 GOOGLE_NEWS_PROXY_URL 未設定，將使用 Yahoo/RSS2JSON/Google News fallback。")
+    print("📰 使用本地端新聞抓取：Yahoo 股市 RSS + Google News RSS。")
 
     resolved_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
     if resolved_name and not re.fullmatch(r"\d{4,6}", resolved_name):
@@ -754,54 +742,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             advanced_query = f'{query_str} -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
         query = urllib.parse.quote(advanced_query)
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        rss2json_url = "https://api.rss2json.com/v1/api.json?rss_url=" + urllib.parse.quote(url, safe="")
         last_error = None
-
-        def _try_proxy(q: str):
-            proxy_res = requests.get(
-                proxy_url,
-                params={"q": q, "days": days},
-                headers=headers,
-                timeout=10,
-            )
-            proxy_res.raise_for_status()
-            content_type = proxy_res.headers.get("Content-Type", "")
-            text = proxy_res.text.strip()
-            if "json" in content_type.lower() or text.startswith("{"):
-                payload = proxy_res.json()
-                if payload.get("status") == "ok":
-                    titles = [
-                        item.get("title")
-                        for item in payload.get("items", [])
-                        if item.get("title")
-                    ]
-                    return titles
-                raise RuntimeError(payload.get("message") or "GAS proxy did not return ok")
-            root = ET.fromstring(proxy_res.text)
-            titles = [
-                item.find("title").text
-                for item in root.findall(".//item")
-                if item.find("title") is not None and item.find("title").text
-            ]
-            return titles
-
-        if proxy_url:
-            try:
-                titles = _try_proxy(advanced_query)
-                if titles:
-                    return titles
-                last_error = RuntimeError("GAS proxy returned no RSS titles")
-            except Exception as e:
-                last_error = e
-                # Retry with a simpler query string in case advanced operators are rejected.
-                try:
-                    fallback_q = f"\"{query_str}\"" if exact else str(query_str)
-                    titles = _try_proxy(fallback_q)
-                    if titles:
-                        return titles
-                    last_error = RuntimeError("GAS proxy returned no RSS titles (fallback query)")
-                except Exception as e2:
-                    last_error = e2
 
         for attempt in range(2):
             try:
@@ -814,20 +755,7 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
                 if attempt == 0:
                     time.sleep(0.5)
 
-        try:
-            proxy_res = requests.get(rss2json_url, headers=headers, timeout=8)
-            proxy_res.raise_for_status()
-            payload = proxy_res.json()
-            if payload.get("status") == "ok":
-                return [
-                    item.get("title")
-                    for item in payload.get("items", [])
-                    if item.get("title")
-                ]
-            last_error = RuntimeError(payload.get("message") or "RSS2JSON did not return ok")
-        except Exception as e:
-            last_error = e
-        source_label = "GAS proxy / Google News / RSS2JSON"
+        source_label = "Google News RSS"
         print(f"❌ {source_label} 抓取失敗 ({query_str})！: {last_error}")
         return None
 
@@ -926,14 +854,14 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
             continue
         had_fetch_success = True
         stock_titles.extend(titles)
-        print(f"📰 Google/RSS2JSON/GAS 成功：+{len(titles)} 則（query={query_text}）")
+        print(f"📰 Google News RSS 成功：+{len(titles)} 則（query={query_text}）")
         if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
             break
 
     if not had_fetch_success:
         print("📰 新聞抓取最終失敗：所有來源皆無法連線或解析")
         return {
-            "news_summary": "新聞抓取失敗：目前無法連線或解析 Yahoo 股市 RSS / Google News RSS，請稍後重試。",
+            "news_summary": "新聞抓取失敗：本地新聞來源暫時無法取得，請稍後重試。",
             "sentiment_score": 0.0,
             "raw_news": [],
             "news_count_status": "fetch_failed",
@@ -1540,7 +1468,7 @@ def generate_portfolio_analysis_stream(rows, user_input, investor_profile, inten
     yield from cached_generate_text_stream("portfolio_analysis", prompt, ttl_seconds=43200)
 
 
-def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history):
+def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history, user_news_snippet: str | None = None):
     dashboard_data = dashboard_data or {}
     ticker = dashboard_data.get("ticker", "未知")
     company_name = dashboard_data.get("company_name", ticker)
@@ -1556,10 +1484,15 @@ def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history):
         recent = [m for m in chat_history[-8:] if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         recent_history = "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in recent)
 
+    snippet_block = ""
+    if user_news_snippet:
+        snippet_block = f"\n\n【使用者提供的新聞片段（僅作追問參考）】\n{user_news_snippet.strip()[:500]}"
+
     prompt = f'''你是一位台股投資顧問，正在與使用者針對「{company_name}（{ticker}）」進行持續對話。
 請全程使用繁體中文，語氣像一位有立場的朋友而非免責機器人。
 
 【使用者最新問題】：{user_input}
+{snippet_block}
 
 【對話歷史】：
 {recent_history if recent_history else "（無歷史）"}
