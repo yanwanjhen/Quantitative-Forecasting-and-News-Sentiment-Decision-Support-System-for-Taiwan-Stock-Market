@@ -24,9 +24,16 @@ if _project_root not in sys.path:
 from config import model_llm
 
 API_CACHE_PATH = Path(_project_root) / "data" / "api_cache.json"
-USE_AI_NEWS_FILTER = os.getenv("USE_AI_NEWS_FILTER", "0") == "1"
-ENABLE_QUANT_MODEL = os.getenv("ENABLE_QUANT_MODEL", "0") == "1"
-GOOGLE_NEWS_PROXY_URL = os.getenv("GOOGLE_NEWS_PROXY_URL", "").strip()
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip() == "1"
+
+def _env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+USE_AI_NEWS_FILTER = _env_flag("USE_AI_NEWS_FILTER", "0")
+ENABLE_QUANT_MODEL = _env_flag("ENABLE_QUANT_MODEL", "0")
+# NOTE: read per-call in fetch_stock_or_macro_sentiment to avoid stale values across deploys.
+GOOGLE_NEWS_PROXY_URL = _env_str("GOOGLE_NEWS_PROXY_URL", "")
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
@@ -61,6 +68,9 @@ def _keyword_sentiment_score(text):
 
 def _safe_sentiment_score(text, target_company=None):
     try:
+        # Render 512MB plan: do not even attempt to import FinBERT unless explicitly enabled.
+        if not _env_flag("ENABLE_FINBERT", "0"):
+            raise RuntimeError("FinBERT disabled")
         from sentiment_analysis import get_finbert_continuous_score
 
         return get_finbert_continuous_score(text, target_company=target_company)
@@ -671,8 +681,9 @@ def filter_pure_news_with_ai(company_name, news_list, aliases=None):
 
 @ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
-    if GOOGLE_NEWS_PROXY_URL:
-        print(f"📰 GOOGLE_NEWS_PROXY_URL 已設定：{GOOGLE_NEWS_PROXY_URL[:40]}...")
+    proxy_url = _env_str("GOOGLE_NEWS_PROXY_URL", "")
+    if proxy_url:
+        print(f"📰 GOOGLE_NEWS_PROXY_URL 已設定：{proxy_url[:40]}...")
     else:
         print("📰 GOOGLE_NEWS_PROXY_URL 未設定，將使用 Yahoo/RSS2JSON/Google News fallback。")
 
@@ -746,34 +757,51 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         rss2json_url = "https://api.rss2json.com/v1/api.json?rss_url=" + urllib.parse.quote(url, safe="")
         last_error = None
 
-        if GOOGLE_NEWS_PROXY_URL:
+        def _try_proxy(q: str):
+            proxy_res = requests.get(
+                proxy_url,
+                params={"q": q, "days": days},
+                headers=headers,
+                timeout=10,
+            )
+            proxy_res.raise_for_status()
+            content_type = proxy_res.headers.get("Content-Type", "")
+            text = proxy_res.text.strip()
+            if "json" in content_type.lower() or text.startswith("{"):
+                payload = proxy_res.json()
+                if payload.get("status") == "ok":
+                    titles = [
+                        item.get("title")
+                        for item in payload.get("items", [])
+                        if item.get("title")
+                    ]
+                    return titles
+                raise RuntimeError(payload.get("message") or "GAS proxy did not return ok")
+            root = ET.fromstring(proxy_res.text)
+            titles = [
+                item.find("title").text
+                for item in root.findall(".//item")
+                if item.find("title") is not None and item.find("title").text
+            ]
+            return titles
+
+        if proxy_url:
             try:
-                proxy_res = requests.get(
-                    GOOGLE_NEWS_PROXY_URL,
-                    params={"q": advanced_query, "days": days},
-                    headers=headers,
-                    timeout=8,
-                )
-                proxy_res.raise_for_status()
-                content_type = proxy_res.headers.get("Content-Type", "")
-                text = proxy_res.text.strip()
-                if "json" in content_type.lower() or text.startswith("{"):
-                    payload = proxy_res.json()
-                    if payload.get("status") == "ok":
-                        return [
-                            item.get("title")
-                            for item in payload.get("items", [])
-                            if item.get("title")
-                        ]
-                    last_error = RuntimeError(payload.get("message") or "GAS proxy did not return ok")
-                else:
-                    root = ET.fromstring(proxy_res.text)
-                    titles = [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
-                    if titles:
-                        return titles
-                    last_error = RuntimeError("GAS proxy returned no RSS titles")
+                titles = _try_proxy(advanced_query)
+                if titles:
+                    return titles
+                last_error = RuntimeError("GAS proxy returned no RSS titles")
             except Exception as e:
                 last_error = e
+                # Retry with a simpler query string in case advanced operators are rejected.
+                try:
+                    fallback_q = f"\"{query_str}\"" if exact else str(query_str)
+                    titles = _try_proxy(fallback_q)
+                    if titles:
+                        return titles
+                    last_error = RuntimeError("GAS proxy returned no RSS titles (fallback query)")
+                except Exception as e2:
+                    last_error = e2
 
         for attempt in range(2):
             try:
