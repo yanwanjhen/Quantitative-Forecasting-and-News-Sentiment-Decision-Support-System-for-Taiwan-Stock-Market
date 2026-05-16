@@ -39,6 +39,9 @@ Backend:
 ```bash
 CORS_ALLOW_ORIGINS=https://your-frontend.vercel.app
 PYTHON_VERSION=3.11.10
+ENABLE_FINBERT=0
+ENABLE_QUANT_MODEL=0
+PRELOAD_FINBERT=0
 REQUIRE_USER_API_KEY=1
 ```
 
@@ -52,6 +55,7 @@ Use the included `render.yaml`, or configure manually:
 - Start command: `uvicorn api_server:app --host 0.0.0.0 --port $PORT`
 - Health check: `/api/health`
 - Python version: `3.11.10`
+- Free tier memory mode: keep `ENABLE_FINBERT=0`, `ENABLE_QUANT_MODEL=0`, and `PRELOAD_FINBERT=0`. Upgrade the instance and set them to `1` only if you want to run FinBERT and the PyTorch quant model in production.
 
 After Vercel gives you the frontend URL, set `CORS_ALLOW_ORIGINS` on Render to that exact origin.
 

@@ -8,6 +8,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.10"
+      - key: ENABLE_FINBERT
+        value: "0"
+      - key: ENABLE_QUANT_MODEL
+        value: "0"
+      - key: PRELOAD_FINBERT
+        value: "0"
       - key: CORS_ALLOW_ORIGINS
         sync: false
       - key: REQUIRE_USER_API_KEY

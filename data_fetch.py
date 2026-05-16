@@ -29,6 +29,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 USE_AI_NEWS_FILTER = _env_flag("USE_AI_NEWS_FILTER", "0")
 ENABLE_QUANT_MODEL = _env_flag("ENABLE_QUANT_MODEL", "1")
+ENABLE_FINBERT = _env_flag("ENABLE_FINBERT", "1")
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
@@ -98,6 +99,8 @@ def _safe_extract_keywords(text):
 
 
 def _keyword_sentiment_score(text):
+    from sentiment_analysis import _keyword_hits
+
     pos_hits, neg_hits = _keyword_hits(str(text or ""))
     if not pos_hits and not neg_hits:
         return 0.0
@@ -106,6 +109,8 @@ def _keyword_sentiment_score(text):
 
 
 def _safe_sentiment_score(text, target_company=None):
+    if not ENABLE_FINBERT:
+        return _keyword_sentiment_score(text)
     try:
         from sentiment_analysis import get_finbert_continuous_score
 

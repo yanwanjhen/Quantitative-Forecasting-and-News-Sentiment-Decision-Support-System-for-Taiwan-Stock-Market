@@ -147,6 +147,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def _preload_finbert():
     """Pre-warm the FinBERT model for the local-only app."""
+    if os.getenv("PRELOAD_FINBERT", "").strip() not in {"1", "true", "True", "yes", "YES"}:
+        print("FinBERT 預熱已停用；小型雲端主機會使用首次請求載入或關鍵字備援。")
+        return
     try:
         from sentiment_analysis import warm_finbert_model
 
