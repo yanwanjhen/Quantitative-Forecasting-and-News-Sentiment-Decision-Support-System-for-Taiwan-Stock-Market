@@ -1,6 +1,10 @@
 import type { ChatMessage, InvestorProfile, SessionsResponse, StreamEvent } from "./types";
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+
+export function getApiBaseUrl(): string {
+  return API_BASE;
+}
 
 export async function loadSessions(userId?: string): Promise<SessionsResponse> {
   const suffix = userId ? `?user_id=${encodeURIComponent(userId)}` : "";

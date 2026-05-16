@@ -19,7 +19,7 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { createSession, loadSessions, streamMessage, updateProfile } from "./api";
+import { createSession, getApiBaseUrl, loadSessions, streamMessage, updateProfile } from "./api";
 import type { AnalysisContext, ChatMessage, ChatSession, DashboardData, InvestorProfile, StreamEvent } from "./types";
 import "./styles.css";
 
@@ -103,7 +103,7 @@ function App() {
             },
           ],
         };
-        setLoadError("無法連線到 FastAPI 後端，請確認後端服務或 VITE_API_BASE_URL 設定。");
+        setLoadError(`無法連線到 FastAPI 後端（${getApiBaseUrl()}），請確認後端服務或 VITE_API_BASE_URL 設定。`);
         setSessions([fallbackSession]);
         setActiveSessionId(fallbackSession.session_id);
       });
@@ -449,7 +449,7 @@ function App() {
       }
       const message = error instanceof Error ? error.message : "Unable to stream message";
       liveAssistant = { ...liveAssistant, content: `送出失敗：${message}` };
-      setLoadError("訊息未送達，請確認 FastAPI 後端與 API key 設定後再試一次。");
+      setLoadError(`訊息未送達，請確認 FastAPI 後端（${getApiBaseUrl()}）與 API key 設定後再試一次。`);
       setStatusSteps([]);
       setStreamStartedAt(null);
       setLastElapsedMs(Date.now() - requestStarted);
