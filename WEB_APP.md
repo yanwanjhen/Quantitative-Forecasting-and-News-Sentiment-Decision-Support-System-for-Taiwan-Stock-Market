@@ -38,6 +38,7 @@ Backend:
 
 ```bash
 CORS_ALLOW_ORIGINS=https://your-frontend.vercel.app
+PYTHON_VERSION=3.11.10
 REQUIRE_USER_API_KEY=1
 ```
 
@@ -50,6 +51,7 @@ Use the included `render.yaml`, or configure manually:
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn api_server:app --host 0.0.0.0 --port $PORT`
 - Health check: `/api/health`
+- Python version: `3.11.10`
 
 After Vercel gives you the frontend URL, set `CORS_ALLOW_ORIGINS` on Render to that exact origin.
 
