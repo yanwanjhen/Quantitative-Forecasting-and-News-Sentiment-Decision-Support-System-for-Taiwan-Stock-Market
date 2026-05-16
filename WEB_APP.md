@@ -38,6 +38,7 @@ Backend:
 
 ```bash
 CORS_ALLOW_ORIGINS=https://your-frontend.vercel.app
+CORS_ALLOW_ORIGIN_REGEX=^(http://(localhost|127\.0\.0\.1):[0-9]+|https://quantitative-forecasting-and-news-sentiment-decision-[a-z0-9]+\.vercel\.app)$
 PYTHON_VERSION=3.11.10
 ENABLE_FINBERT=0
 ENABLE_QUANT_MODEL=0
@@ -58,6 +59,7 @@ Use the included `render.yaml`, or configure manually:
 - Free tier memory mode: keep `ENABLE_FINBERT=0`, `ENABLE_QUANT_MODEL=0`, and `PRELOAD_FINBERT=0`. Upgrade the instance and set them to `1` only if you want to run FinBERT and the PyTorch quant model in production.
 
 After Vercel gives you the frontend URL, set `CORS_ALLOW_ORIGINS` on Render to that exact origin.
+For Vercel preview URLs, `CORS_ALLOW_ORIGIN_REGEX` can allow the whole project preview URL pattern.
 
 ## Vercel Frontend
 

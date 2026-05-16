@@ -16,5 +16,7 @@ services:
         value: "0"
       - key: CORS_ALLOW_ORIGINS
         sync: false
+      - key: CORS_ALLOW_ORIGIN_REGEX
+        value: "^(http://(localhost|127\\.0\\.0\\.1):[0-9]+|https://quantitative-forecasting-and-news-sentiment-decision-[a-z0-9]+\\.vercel\\.app)$"
       - key: REQUIRE_USER_API_KEY
         value: "1"

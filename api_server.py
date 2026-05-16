@@ -133,12 +133,15 @@ _default_dev_origins = [
 ]
 
 cors_allow_origins = _env_csv("CORS_ALLOW_ORIGINS") or _default_dev_origins
-local_cors_regex = r"^http://(localhost|127\.0\.0\.1):[0-9]+$"
+cors_allow_origin_regex = os.getenv(
+    "CORS_ALLOW_ORIGIN_REGEX",
+    r"^(http://(localhost|127\.0\.0\.1):[0-9]+|https://quantitative-forecasting-and-news-sentiment-decision-[a-z0-9]+\.vercel\.app)$",
+).strip()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins,
-    allow_origin_regex=local_cors_regex,
+    allow_origin_regex=cors_allow_origin_regex or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
