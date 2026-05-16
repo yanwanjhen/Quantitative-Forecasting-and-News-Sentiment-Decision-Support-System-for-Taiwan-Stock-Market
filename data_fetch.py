@@ -32,6 +32,50 @@ ENABLE_QUANT_MODEL = _env_flag("ENABLE_QUANT_MODEL", "1")
 EXTERNAL_STOCK_MAP_PATH = Path(_project_root) / "data" / "tw_stock_map.json"
 MAX_SENTIMENT_NEWS = 30
 _MEMOIZED_CACHE: dict[tuple, tuple[float, object]] = {}
+NEWS_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml,application/xml,text/xml,application/json,text/html;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+
+def _fetch_news_url(url, source_label, timeout=6, retries=2):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=NEWS_HTTP_HEADERS, timeout=timeout + attempt * 2)
+            if response.status_code in {403, 429}:
+                last_error = f"HTTP {response.status_code}"
+                if attempt < retries - 1:
+                    time.sleep(0.6 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(0.6 * (attempt + 1))
+    print(f"❌ {source_label} 抓取失敗: {last_error}")
+    return None
+
+
+def _cached_news_source(source, cache_identity, fetcher, ttl=1800):
+    key_digest = hashlib.sha256(json.dumps(cache_identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    key = ("news_source", source, key_digest)
+    now = time.time()
+    cached = _MEMOIZED_CACHE.get(key)
+    if cached and now - cached[0] < ttl:
+        return deepcopy(cached[1])
+    result = fetcher()
+    if result is not None:
+        _MEMOIZED_CACHE[key] = (now, deepcopy(result))
+    return deepcopy(result)
 
 
 def _load_quant_dependencies():
@@ -301,16 +345,41 @@ def sentiment_label_from_score(score: float) -> str:
 INVESTMENT_KEYWORDS = [
     "股票", "台股", "大盤", "加權", "投資", "買", "賣", "持有", "持股", "進場",
     "出場", "停損", "停利", "報酬", "走勢", "股價", "技術", "新聞", "情緒",
+    "外資", "投信", "自營商", "三大法人", "融資", "融券",
 ]
 
 FINANCIAL_TERMS = [
-    "EPS", "eps", "每股盈餘", "本益比", "PER", "PE", "P/E", "殖利率", "股利",
-    "股息", "MACD", "macd", "KD", "RSI", "均線", "月線", "季線", "年線",
-    "量化訊號", "情緒分數", "Max DD", "最大回撤", "停損", "停利", "除權息",
-    "營收", "毛利率", "淨利率", "ROE", "ROA", "自由現金流", "融資", "融券",
+    # Common valuation / fundamentals
+    "EPS", "每股盈餘",
+    "本益比", "PER", "PE", "P/E",
+    "本淨比", "PBR", "PB", "P/B", "股價淨值比",
+    "殖利率", "股利", "股息", "現金股利", "股票股利",
+    "ROE", "ROA", "營益率", "毛利率", "淨利率", "自由現金流", "FCF",
+    "營收", "月營收", "年增", "季增", "YoY", "QoQ",
+    "PEG", "Beta", "β", "Sharpe", "夏普", "波動", "標準差",
+    # Technicals
+    "K線", "K 線", "成交量", "量價", "均價", "均線", "月線", "季線", "年線",
+    "RSI", "KD", "MACD",
+    "乖離率", "布林通道", "Bollinger",
+    "黃金交叉", "死亡交叉",
+    "支撐", "壓力", "突破", "跌破", "回測", "反彈", "整理", "趨勢",
+    # Trading / margin
+    "停損", "停利", "風險報酬", "回撤", "Max DD", "最大回撤",
+    "融資", "融券", "融資使用率", "券資比", "周轉率",
+    # Our UI terms
+    "量化訊號", "情緒分數", "建議可信度",
 ]
 
-UNRELATED_KEYWORDS = ["天氣", "寫程式", "食譜", "旅遊", "翻譯", "笑話", "電影", "音樂"]
+UNRELATED_KEYWORDS = [
+    "天氣", "氣象", "溫度", "下雨",
+    "寫程式", "程式", "coding", "bug",
+    "食譜", "料理", "減肥",
+    "旅遊", "機票", "住宿",
+    "翻譯", "英文", "日文",
+    "笑話", "梗圖",
+    "電影", "音樂", "遊戲",
+    "星座", "算命",
+]
 
 def find_stock_mentions(text):
     text = (text or "").strip()
@@ -376,9 +445,12 @@ def _save_api_cache(cache):
     except Exception as e:
         print(f"⚠️ API 快取儲存失敗: {e}")
 
+CACHE_SCHEMA_VERSION = "local-v4-complete-text"
+
+
 def _api_cache_key(namespace, prompt):
     model_name = getattr(model_llm, "model", "llm")
-    digest = hashlib.sha256(f"{model_name}:{prompt}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{CACHE_SCHEMA_VERSION}:{model_name}:{prompt}".encode("utf-8")).hexdigest()
     return f"{namespace}:{digest}"
 
 def _get_cached_text(namespace, prompt, ttl_seconds):
@@ -427,12 +499,16 @@ def cached_generate_text_stream(namespace, prompt, ttl_seconds=43200):
 
     chunks = []
     started_at = time.time()
+    timed_out = False
     response = model_llm.generate_content(prompt, stream=True)
     for chunk in response:
-        if time.time() - started_at > 45:
+        if time.time() - started_at > 120:
             if not chunks:
                 raise TimeoutError("LLM 回覆生成逾時")
-            chunks.append("\n\n（分析生成時間較長，以上先提供目前可用重點。）")
+            timed_out = True
+            timeout_note = "\n\n（分析生成時間較長，以下先提供目前可用重點；若需要更完整細節，可針對其中一段再追問。）"
+            chunks.append(timeout_note)
+            yield timeout_note
             break
         try:
             if chunk.text:
@@ -442,7 +518,8 @@ def cached_generate_text_stream(namespace, prompt, ttl_seconds=43200):
             pass
 
     final_text = "".join(chunks)
-    if final_text:
+    # Do not cache partial timeout output; otherwise users keep seeing the same truncated answer.
+    if final_text and not timed_out:
         _set_cached_text(namespace, prompt, final_text)
 
 def split_user_news_items(user_input):
@@ -550,8 +627,105 @@ def generate_user_news_sentiment_answer_stream(user_input, analysis, investor_pr
     """
     yield from cached_generate_text_stream("user_news_sentiment", prompt, ttl_seconds=21600)
 
+def _static_financial_term_answer(user_input, investor_profile=None):
+    investor_profile = investor_profile or {}
+    text = (user_input or "").lower()
+    style = investor_profile.get("style", "穩健")
+
+    term_guides = {
+        "本益比": (
+            "本益比是什麼",
+            "本益比可以想成「你願意付幾年的獲利，買下這家公司」。例如本益比 20 倍，粗略理解就是市場願意用約 20 年獲利的價格來買它。",
+            "它常用來判斷股價相對獲利是貴還是便宜。高本益比不一定代表不能買，可能代表市場期待成長；低本益比也不一定便宜，可能是獲利正在下滑。",
+            "看本益比時要和同產業、公司成長率、景氣循環一起看。對穩健投資人來說，本益比偏高時不要一次重押，最好等回檔或等獲利成長跟上估值。"
+        ),
+        "macd": (
+            "MACD 是什麼",
+            "MACD 是用兩條移動平均線的差距，判斷股價動能是變強還是變弱的技術指標。",
+            "白話說，它像是在看車子的加速度：價格還在漲，不代表動能一定變強；MACD 可以幫你看漲勢是不是開始沒力。",
+            "常見用法是看 DIF、MACD 柱狀體與零軸。由負翻正通常代表動能改善，但不能只靠 MACD 買賣，還要搭配均線、成交量與支撐壓力。"
+        ),
+        "rsi": (
+            "RSI 是什麼",
+            "RSI 是衡量一段時間內買盤或賣盤力道強弱的指標，可以想成股價短線熱度計。",
+            "一般常用 30 和 70 當參考：RSI 高於 70 可能偏熱，低於 30 可能偏冷，但強勢股可能長時間維持高檔。",
+            "穩健用法是不要看到 RSI 低就立刻買，而是搭配支撐、趨勢和量能確認是否真的止跌。"
+        ),
+        "kd": (
+            "KD 是什麼",
+            "KD 是觀察短線價格位置與轉折的技術指標，常用來看股價是否偏熱、偏冷，或是否出現轉強/轉弱訊號。",
+            "K 線上穿 D 線常被稱為黃金交叉，可能代表短線轉強；K 線下穿 D 線則可能代表短線轉弱。",
+            "KD 在盤整區比較有用，但在強趨勢行情容易出現假訊號，所以要搭配趨勢和成交量。"
+        ),
+        "roe": (
+            "ROE 是什麼",
+            "ROE 是股東權益報酬率，代表公司用股東投入的資本創造獲利的能力。",
+            "可以把它想成公司使用資金的效率。ROE 越高通常代表經營效率越好，但也要確認不是靠高負債撐出來的。",
+            "看 ROE 要搭配毛利率、負債比與現金流。穩健投資人適合找 ROE 穩定、不是只靠一次性收益拉高的公司。"
+        ),
+        "eps": (
+            "EPS 是什麼",
+            "EPS 是每股盈餘，代表公司賺到的錢平均分到每一股是多少。",
+            "EPS 越高通常代表公司獲利能力越強，但要看它是持續成長，還是只有單季一次性暴衝。",
+            "EPS 常和本益比一起看：股價除以 EPS 就是本益比。買股票時，不只看 EPS 高低，也要看未來能不能維持。"
+        ),
+        "殖利率": (
+            "殖利率是什麼",
+            "殖利率是股利相對股價的比例，可以想成你用現在價格買進後，股利帶來的現金回報率。",
+            "例如股價 100 元、現金股利 5 元，殖利率就是 5%。",
+            "高殖利率不一定安全，可能是股價下跌造成殖利率變高。穩健投資人要看公司配息是否穩定、現金流是否支撐得住。"
+        ),
+        "融資": (
+            "融資使用率是什麼",
+            "融資代表投資人借錢買股票，融資使用率越高，通常表示市場槓桿越重。",
+            "如果股價下跌，融資部位容易被迫賣出，造成跌勢加劇。",
+            "穩健投資人看到融資偏高時，要提高警覺，避免在籌碼過熱時追高。"
+        ),
+    }
+
+    selected = None
+    for key, guide in term_guides.items():
+        aliases = [key]
+        if key == "本益比":
+            aliases += ["pe", "p/e", "per"]
+        if key == "macd":
+            aliases += ["macd"]
+        if key == "rsi":
+            aliases += ["rsi"]
+        if key == "kd":
+            aliases += ["kd"]
+        if key == "roe":
+            aliases += ["roe"]
+        if key == "eps":
+            aliases += ["eps", "每股盈餘"]
+        if key == "殖利率":
+            aliases += ["殖利率", "股息殖利率"]
+        if key == "融資":
+            aliases += ["融資", "融資使用率"]
+        if any(alias.lower() in text for alias in aliases):
+            selected = guide
+            break
+
+    if not selected:
+        return None
+
+    title, plain, application, caution = selected
+    return (
+        f"### {title}\n\n"
+        f"**白話說明**：{plain}\n\n"
+        f"**實際怎麼用**：{application}\n\n"
+        f"**常見誤區**：不要只看單一數字就下買賣決策，最好同時搭配產業位置、趨勢、成交量與公司基本面。\n\n"
+        f"**以「{style}」風格來看**：{caution}"
+    )
+
+
 def generate_financial_term_answer_stream(user_input, investor_profile=None):
     investor_profile = investor_profile or {}
+    static_answer = _static_financial_term_answer(user_input, investor_profile)
+    if static_answer:
+        yield static_answer
+        return
+
     prompt = f'''你是一位台股投資教練，擅長把複雜金融概念說得讓人聽懂、記得住。
 請全程使用繁體中文，語氣自然，像在跟朋友說話。
 
@@ -673,7 +847,7 @@ def filter_pure_news_with_ai(company_name, news_list, aliases=None):
 
 @ttl_cache_data(ttl=1800)
 def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
-    print("📰 使用本地端新聞抓取：Yahoo 股市 RSS + Google News RSS。")
+    print("📰 使用本地端新聞抓取：Yahoo 股市 RSS + Google News RSS + GDELT 備援。")
 
     resolved_name = resolve_tw_company_name(str(ticker or ""), str(company_name or ""))
     if resolved_name and not re.fullmatch(r"\d{4,6}", resolved_name):
@@ -697,18 +871,6 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
     else:
         search_keyword = company_name
     
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
     def collect_aliases():
         if is_macro:
             return []
@@ -729,65 +891,108 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         return aliases
 
     trusted_aliases = collect_aliases()
-    
-    def get_google_news(query_str, exact=True):
+
+    def news_search_query(query_str, exact=True):
         # 嚴格排除任何討論區、論壇、農場文，確保新聞來源為正規財經新聞
         # 個股：給公司名稱加上雙引號，強制精準搜尋
         # 大盤：採用 OR 擴充（避免 "大盤" 太難搜到真正台股市場新聞）
         if is_macro:
-            advanced_query = f'({query_str}) -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
-        elif exact:
-            advanced_query = f'"{query_str}" -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
-        else:
-            advanced_query = f'{query_str} -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+            return f'({query_str}) -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+        if exact:
+            return f'"{query_str}" -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+        return f'{query_str} -site:cmoney.tw -同學會 -討論 -PTT -Dcard -Mobile01 -社團 -貼文 -懶人包'
+    
+    def get_google_news(query_str, exact=True):
+        advanced_query = news_search_query(query_str, exact=exact)
         query = urllib.parse.quote(advanced_query)
         url = f"https://news.google.com/rss/search?q={query}+when:{days}d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        last_error = None
 
-        for attempt in range(2):
+        def fetcher():
+            text = _fetch_news_url(url, f"Google News RSS ({query_str})", timeout=4, retries=2)
+            if text is None:
+                return None
             try:
-                res = requests.get(url, headers=headers, timeout=4 + attempt * 2)
-                res.raise_for_status()
-                root = ET.fromstring(res.text)
+                root = ET.fromstring(text)
                 return [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
-            except Exception as e:
-                last_error = e
-                if attempt == 0:
-                    time.sleep(0.5)
+            except Exception as exc:
+                print(f"❌ Google News RSS 解析失敗 ({query_str})！: {exc}")
+                return None
 
-        source_label = "Google News RSS"
-        print(f"❌ {source_label} 抓取失敗 ({query_str})！: {last_error}")
-        return None
+        return _cached_news_source("google_news", [query_str, exact, days, is_macro], fetcher)
+
+    def get_gdelt_news(query_str, exact=True):
+        if is_macro:
+            gdelt_query = '(台股 OR 加權指數 OR 加權)'
+        elif exact:
+            gdelt_query = f'"{query_str}"'
+        else:
+            gdelt_query = query_str
+        query = urllib.parse.quote(gdelt_query)
+        url = (
+            "https://api.gdeltproject.org/api/v2/doc/doc"
+            f"?query={query}&mode=artlist&format=json&sort=datedesc"
+            f"&maxrecords={MAX_SENTIMENT_NEWS}&timespan={max(1, int(days))}d"
+        )
+
+        def fetcher():
+            text = _fetch_news_url(url, f"GDELT DOC API ({query_str})", timeout=8, retries=2)
+            if text is None:
+                return None
+            try:
+                payload = json.loads(text)
+            except Exception as exc:
+                print(f"❌ GDELT DOC API 解析失敗 ({query_str})！: {exc}")
+                return None
+            articles = payload.get("articles") if isinstance(payload, dict) else None
+            if not isinstance(articles, list):
+                return []
+            titles = []
+            for article in articles:
+                if not isinstance(article, dict):
+                    continue
+                title = str(article.get("title") or "").strip()
+                if not title:
+                    continue
+                domain = str(article.get("domain") or "").strip()
+                titles.append(f"{title} - {domain}" if domain else title)
+            return titles
+
+        return _cached_news_source("gdelt", [query_str, exact, days, is_macro], fetcher)
 
     def get_yahoo_news():
         code = str(ticker or "").upper().replace(".TWO", "").replace(".TW", "")
         url = "https://tw.stock.yahoo.com/rss?category=tw-market" if is_macro else f"https://tw.stock.yahoo.com/rss?s={code}"
-        try:
-            res = requests.get(url, headers=headers, timeout=6)
-            res.raise_for_status()
-            root = ET.fromstring(res.text)
-        except Exception as e:
-            print(f"❌ Yahoo 股市 RSS 抓取失敗 ({code or 'market'})！: {e}")
-            return None
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        titles = []
-        for item in root.findall(".//item"):
-            title = item.findtext("title")
-            if not title:
-                continue
-            pub_date = item.findtext("pubDate")
-            if pub_date:
-                try:
-                    parsed = parsedate_to_datetime(pub_date)
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=timezone.utc)
-                    if parsed < cutoff:
+        def fetcher():
+            text = _fetch_news_url(url, f"Yahoo 股市 RSS ({code or 'market'})", timeout=6, retries=2)
+            if text is None:
+                return None
+            try:
+                root = ET.fromstring(text)
+            except Exception as exc:
+                print(f"❌ Yahoo 股市 RSS 解析失敗 ({code or 'market'})！: {exc}")
+                return None
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            titles = []
+            for item in root.findall(".//item"):
+                title = item.findtext("title")
+                if not title:
+                    continue
+                pub_date = item.findtext("pubDate")
+                if pub_date:
+                    try:
+                        parsed = parsedate_to_datetime(pub_date)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        if parsed < cutoff:
+                            continue
+                    except Exception:
                         continue
-                except Exception:
-                    pass
-            titles.append(title)
-        return titles
+                titles.append(title)
+            return titles
+
+        return _cached_news_source("yahoo_rss", [code, days, is_macro], fetcher)
 
     def clean_and_dedup(titles):
         import difflib
@@ -855,6 +1060,18 @@ def fetch_stock_or_macro_sentiment(ticker, company_name, days=5):
         had_fetch_success = True
         stock_titles.extend(titles)
         print(f"📰 Google News RSS 成功：+{len(titles)} 則（query={query_text}）")
+        if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
+            break
+
+    for query_text, exact in query_plan:
+        if len(stock_titles) >= MAX_SENTIMENT_NEWS:
+            break
+        titles = get_gdelt_news(query_text, exact=exact)
+        if titles is None:
+            continue
+        had_fetch_success = True
+        stock_titles.extend(titles)
+        print(f"📰 GDELT 備援成功：+{len(titles)} 則（query={query_text}）")
         if len(stock_titles) >= MAX_SENTIMENT_NEWS * 2:
             break
 
@@ -1200,19 +1417,19 @@ def extract_intent_with_rules(user_input, default_horizon, default_risk):
             "intent_source": "rule",
         }
 
-    if has_financial_term and not re.search(r'(?<!\d)(\d{4})(?:\.(TW|TWO))?(?!\d)', text, re.IGNORECASE):
+    # Financial terms without an explicit stock: always answer as a term explanation.
+    # (If the user wants a specific stock, they can add ticker/company name.)
+    if has_financial_term and not re.search(r"(?<!\d)(\d{4})(?:\.(TW|TWO))?(?!\d)", text, re.IGNORECASE):
         mentioned_stock = any(company_name in text for company_name in COMMON_TW_STOCKS)
         if not mentioned_stock:
-            # Check if using LLM might resolve it later, so don't early exit to FINANCIAL_TERM if missing stock in COMMON
-            if not any(kw in text for keyword_list in [INVESTMENT_KEYWORDS, UNRELATED_KEYWORDS] for kw in keyword_list):
-                return {
-                    "ticker": None,
-                    "company_name": "金融術語",
-                    "intent_type": "FINANCIAL_TERM",
-                    "horizon": default_horizon,
-                    "risk_tolerance": default_risk,
-                    "intent_source": "rule",
-                }
+            return {
+                "ticker": None,
+                "company_name": "金融術語",
+                "intent_type": "FINANCIAL_TERM",
+                "horizon": default_horizon,
+                "risk_tolerance": default_risk,
+                "intent_source": "rule",
+            }
 
     stock_mentions = find_stock_mentions(text)
     if stock_mentions:
@@ -1259,10 +1476,9 @@ def extract_intent_with_rules(user_input, default_horizon, default_risk):
             "intent_source": "rule",
         }
 
-    # Remove the overly aggressive has_investment_context early return.
-    # We will let the LLM handle cases where no hard-coded rules hit.
-
-    if any(keyword in text for keyword in UNRELATED_KEYWORDS):
+    # Unrelated or small talk: avoid stock lookup attempts.
+    # If it doesn't look like Taiwan stock/investment context, treat as unrelated.
+    if (not has_investment_context and not any(keyword in text for keyword in ["大盤", "台股", "加權指數", "加權"])) or any(keyword in text for keyword in UNRELATED_KEYWORDS):
         return {
             "ticker": None,
             "company_name": "未知",
@@ -1470,6 +1686,62 @@ def generate_portfolio_analysis_stream(rows, user_input, investor_profile, inten
 
 def generate_follow_up_answer_stream(user_input, dashboard_data, chat_history, user_news_snippet: str | None = None):
     dashboard_data = dashboard_data or {}
+    if dashboard_data.get("mode") == "compare":
+        rows = dashboard_data.get("compare_rows") or []
+        stocks = dashboard_data.get("stocks") or []
+        recommendation = dashboard_data.get("recommendation") or ""
+        investor_profile = dashboard_data.get("investor_profile") or {}
+        compared_names = dashboard_data.get("compared_names") or "、".join(
+            f"{item.get('company_name') or item.get('ticker')}（{item.get('ticker')}）"
+            for item in stocks
+            if isinstance(item, dict)
+        )
+        table_lines = []
+        if rows:
+            columns = list(rows[0].keys())
+            table_lines.append("| " + " | ".join(columns) + " |")
+            table_lines.append("| " + " | ".join(["---"] * len(columns)) + " |")
+            for row in rows:
+                table_lines.append("| " + " | ".join(str(row.get(col, "無")) for col in columns) + " |")
+        compare_table = "\n".join(table_lines) if table_lines else "（比較表暫無可用資料）"
+
+        recent_history = ""
+        if chat_history:
+            recent = [m for m in chat_history[-8:] if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+            recent_history = "\n".join(f"{m['role'].upper()}: {m['content'][:300]}" for m in recent)
+
+        prompt = f'''你是一位台股投資顧問，正在延續上一輪「多檔比較」對話。
+請全程使用繁體中文，直接回答使用者的追問，不要重新要求股票代號。
+
+【使用者最新問題】：{user_input}
+
+【上一輪比較標的】：
+{compared_names}
+
+【上一輪比較表】：
+{compare_table}
+
+【上一輪建議】：
+{recommendation if recommendation else "（上一輪沒有額外建議文字）"}
+
+【對話歷史】：
+{recent_history if recent_history else "（無歷史）"}
+
+【投資設定】：
+- 風格：{investor_profile.get('style', '穩健')}
+- 最大可接受虧損：{investor_profile.get('max_loss_pct', 10)}%
+
+━━━ 回覆準則 ━━━
+- 這是比較結果的追問，必須沿用上方比較表與建議回答。
+- 如果使用者問「只能選一檔 / CP 值 / 預期報酬 vs 風險 / 如何配置」，請明確給出首選、次選、觀望或避免，以及理由。
+- 若某檔資料不足，明講該檔資料不足，但仍用其他已有欄位做保守判斷。
+- 不要說「查無標的」或要求重新輸入代號，除非使用者明確提到不在上一輪比較表中的新股票。
+- 禁止說明你如何判斷問題，也禁止輸出任何內部分類字眼。
+- 禁止輸出任何 HTML 標籤（例如 <br>、<table>、<div>）。只用 Markdown。
+'''
+        yield from cached_generate_text_stream("compare_follow_up", prompt, ttl_seconds=43200)
+        return
+
     ticker = dashboard_data.get("ticker", "未知")
     company_name = dashboard_data.get("company_name", ticker)
     stock_data = dashboard_data.get("stock_data") or {}

@@ -80,7 +80,10 @@ class GroqChatModel:
             ],
             "temperature": 0.2,
             "stream": stream,
-            "max_tokens": 1100,
+            # Local-only mode can afford a little more output budget. 1100 tokens
+            # was too tight for the stock report template and could stop midway
+            # through the final risk note.
+            "max_tokens": 1800,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}

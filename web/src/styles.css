@@ -293,6 +293,27 @@ textarea:focus-visible {
   gap: 6px;
 }
 
+.api-key-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--muted);
+}
+
+.api-key-hint.ok {
+  border-color: rgba(65, 163, 106, 0.45);
+  color: rgba(33, 98, 60, 0.95);
+}
+
+.api-key-hint.warn {
+  border-color: rgba(206, 82, 82, 0.5);
+  color: rgba(132, 35, 35, 0.95);
+}
+
 .sidebar-api-panel label span {
   color: var(--muted);
   font-size: 12px;

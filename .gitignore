@@ -1,4 +1,32 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
 __pycache__/
+**/__pycache__/
+*.py[cod]
+
+# env
+.env
+.env.*
+!.env.example
+
+# Streamlit secrets
+.streamlit/secrets.toml
+web/.streamlit/secrets.toml
+
+# Frontend
+node_modules/
+web/node_modules/
+dist/
+web/dist/
+.vite/
+web/.vite/
+
+# Data / cache
 data/user_histories/*.json
 data/api_cache.json
 
+# Experiment outputs
+experiments/outputs/

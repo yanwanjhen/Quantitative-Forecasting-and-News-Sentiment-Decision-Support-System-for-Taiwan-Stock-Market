@@ -24,6 +24,7 @@ from data_fetch import (
     fetch_stock_or_macro_sentiment,
     find_stock_mentions,
     FINANCIAL_TERMS,
+    UNRELATED_KEYWORDS,
     generate_financial_term_answer_stream,
     generate_follow_up_answer_stream,
     generate_investment_advice_stream,
@@ -76,6 +77,7 @@ class ChatMessage(BaseModel):
     content: str
     created_at: float = Field(default_factory=time.time)
     dashboard_data: Optional[Dict[str, Any]] = None
+    analysis_context: Optional[Dict[str, Any]] = None
 
 
 class SessionSummary(BaseModel):
@@ -269,6 +271,17 @@ def _latest_dashboard(messages: List[ChatMessage]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _latest_analysis_context(messages: List[ChatMessage]) -> Optional[Dict[str, Any]]:
+    for message in reversed(messages):
+        if message.analysis_context:
+            return message.analysis_context
+        if message.dashboard_data:
+            context = dict(message.dashboard_data)
+            context.setdefault("mode", "stock")
+            return context
+    return None
+
+
 def _latest_user_message(messages: List[ChatMessage]) -> str:
     for message in reversed(messages):
         if message.role == "user" and message.content.strip():
@@ -285,6 +298,106 @@ def _looks_like_fresh_analysis(question: str) -> bool:
     if not has_explicit_target:
         return False
     return any(keyword in text for keyword in ["分析", "現在", "位階", "適合", "可以買", "值得買", "走勢", "進場", "幫我看", "想關注"])
+
+
+def _is_refresh_request(question: str) -> bool:
+    text = (question or "").strip()
+    return any(keyword in text for keyword in ["重新分析", "重新抓", "重跑", "再算一次", "更新資料", "最新資料", "重新整理"])
+
+
+def _context_targets(context: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    if not context:
+        return []
+    if context.get("mode") == "compare":
+        stocks = context.get("stocks") or []
+        if isinstance(stocks, list):
+            return _normalize_stock_mentions(stocks)
+        return []
+    ticker = _normalize_ticker(context.get("ticker"))
+    company_name = str(context.get("company_name") or ticker or "")
+    return [{"ticker": ticker, "company_name": company_name}] if ticker or company_name else []
+
+
+def _mentions_different_target(question: str, context: Optional[Dict[str, Any]]) -> bool:
+    targets = _context_targets(context)
+    if not targets:
+        return False
+    context_tickers = {_normalize_ticker(item.get("ticker")) for item in targets if item.get("ticker")}
+    context_names = {str(item.get("company_name") or "") for item in targets if item.get("company_name")}
+    mentioned = find_stock_mentions(question) or []
+    numeric_codes = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", question or "")
+    for code in numeric_codes:
+        if code and code not in context_tickers:
+            return True
+    for item in mentioned:
+        ticker = _normalize_ticker(item.get("ticker"))
+        name = str(item.get("company_name") or "")
+        if ticker and ticker not in context_tickers:
+            return True
+        if name and name not in context_names:
+            return True
+    return False
+
+
+def _mentions_context_target(question: str, context: Optional[Dict[str, Any]]) -> bool:
+    targets = _context_targets(context)
+    if not targets:
+        return False
+    text = question or ""
+    context_tickers = {_normalize_ticker(item.get("ticker")) for item in targets if item.get("ticker")}
+    numeric_codes = set(re.findall(r"(?<!\d)(\d{4,6})(?!\d)", text))
+    if context_tickers.intersection(numeric_codes):
+        return True
+    for item in targets:
+        name = str(item.get("company_name") or "")
+        if name and name not in ["未知", "大盤"] and name in text:
+            return True
+    return False
+
+
+def _is_context_follow_up(question: str, context: Optional[Dict[str, Any]]) -> bool:
+    if not context or _is_refresh_request(question) or _mentions_different_target(question, context):
+        return False
+    text = (question or "").strip()
+    if not text:
+        return False
+    if _mentions_context_target(text, context):
+        return True
+    followup_triggers = [
+        "這篇",
+        "剛剛",
+        "你剛剛",
+        "剛才",
+        "會有影響",
+        "這對",
+        "那這樣",
+        "建議",
+        "進場",
+        "停損",
+        "買入訊號",
+        "可信度",
+        "預期報酬",
+        "只能選",
+        "優先",
+        "哪一檔",
+        "CP",
+        "風險",
+        "配置",
+        "分配",
+        "外資",
+        "庫存",
+        "提款",
+        "修正",
+        "壓力",
+        "利空",
+        "利多",
+        "新聞",
+    ]
+    if any(keyword in text for keyword in followup_triggers):
+        return True
+    if any(term.lower() in text.lower() for term in FINANCIAL_TERMS):
+        return True
+    return False
 
 
 def _looks_like_context_follow_up(question: str, dashboard_data: Optional[Dict[str, Any]]) -> bool:
@@ -372,12 +485,12 @@ def _compare_rank_markdown(rows: List[Dict[str, Any]]) -> str:
 
     def parse_pct(value: Any) -> float:
         s = str(value or "").strip()
-        m = re.search(r"-?\\d+(?:\\.\\d+)?", s)
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
         return float(m.group(0)) if m else 0.0
 
     def parse_dd_abs(value: Any) -> float:
         s = str(value or "")
-        m = re.search(r"-?\\d+(?:\\.\\d+)?", s)
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
         if not m:
             return 999.0
         return abs(float(m.group(0)))
@@ -422,6 +535,28 @@ def _compare_rank_markdown(rows: List[Dict[str, Any]]) -> str:
         for row in insufficient:
             lines.append(f"- {label(row)}：目前資料不足或抓取失敗")
     return "\n".join(lines).strip()
+
+
+def _build_compare_analysis_context(
+    rows: List[Dict[str, Any]],
+    stock_mentions: List[Dict[str, str]],
+    profile: InvestorProfile,
+    heading: str,
+    compared_names: str,
+    recommendation: str,
+) -> Dict[str, Any]:
+    return json.loads(json.dumps({
+        "mode": "compare",
+        "ticker": "COMPARE",
+        "company_name": "多檔比較",
+        "heading": heading,
+        "compared_names": compared_names,
+        "stocks": stock_mentions,
+        "compare_rows": rows,
+        "recommendation": recommendation,
+        "risk": profile.risk_tolerance,
+        "investor_profile": profile.model_dump(),
+    }, ensure_ascii=False, default=str))
 
 
 def _normalize_stock_mentions(stock_mentions: List[Any]) -> List[Dict[str, str]]:
@@ -604,14 +739,89 @@ def sanitize_assistant_text(text: str) -> str:
     return cleaned
 
 
+def _looks_like_unrelated_local(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if any(kw in t for kw in UNRELATED_KEYWORDS):
+        return True
+    # Very short utterances are almost always small talk; avoid stock lookup attempts.
+    if len(t) <= 4 and not re.search(r"(?<!\d)\d{4}(?!\d)", t):
+        return True
+    return False
+
+
+def _looks_like_financial_term_only(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    has_term = any(term.lower() in t.lower() for term in FINANCIAL_TERMS)
+    if not has_term:
+        return False
+    if find_stock_mentions(t):
+        return False
+    if re.search(r"(?<!\d)(\d{4})(?:\.(TW|TWO))?(?!\d)", t, re.IGNORECASE):
+        return False
+    return True
+
+
 def _stream_text(stream: Generator[str, None, None]) -> Generator[str, None, str]:
     chunks: List[str] = []
     for chunk in stream:
         chunks.append(chunk)
     text = sanitize_assistant_text("".join(chunks))
+    text = _ensure_complete_assistant_text(text)
     for start in range(0, len(text), 600):
         yield _event("token", {"text": text[start:start + 600]})
     return text
+
+
+def _ensure_complete_assistant_text(text: str) -> str:
+    cleaned = (text or "").rstrip()
+    if not cleaned:
+        return cleaned
+
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    dangling_warning_patterns = [
+        r"^>?\s*⚠️?\s*本報告\s*$",
+        r"^>?\s*⚠️?\s*本報告基於\s*$",
+        r"^>?\s*⚠️?\s*本報告基於量化模型與新聞情緒模型\s*$",
+        r"^>?\s*⚠️?\s*本報告基於量化模型與新聞情緒模型即時運算\s*[，,]?\s*$",
+    ]
+    has_dangling_warning = any(re.search(pattern, last) for pattern in dangling_warning_patterns)
+    if has_dangling_warning:
+        # Drop the partially generated disclaimer line before appending a clean close.
+        for index in range(len(lines) - 1, -1, -1):
+            if lines[index].strip() == last:
+                lines = lines[:index]
+                break
+        cleaned = "\n".join(lines).rstrip()
+        last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+
+    unfinished_patterns = [
+        r"^[-•o○]$",
+        r"^[-•o○]\s*[\u4e00-\u9fffA-Za-z]{1,2}$",
+        r"^\d+[.、]$",
+        r"^\d+[.、]\s*[\u4e00-\u9fffA-Za-z0-9 ／/：:（）()]{1,18}$",
+        r"^#{1,6}\s*[\u4e00-\u9fffA-Za-z0-9 ／/：:（）()]{1,18}$",
+        r"^[\u4e00-\u9fffA-Za-z0-9 ／/：:（）()]{1,18}[：:]$",
+        r"^(風險管理|停損設定|進場方式|配置建議|操作建議|觀察重點)$",
+        r"^⚠️?\s*本報告.*$",
+    ]
+    looks_unfinished = any(re.search(pattern, last) for pattern in unfinished_patterns)
+    ends_without_sentence = not re.search(r"[。！？.!?）)]$", last)
+    has_timeout_note = "生成時間較長" in cleaned or "目前可用重點" in cleaned
+    if looks_unfinished or has_timeout_note or has_dangling_warning or ends_without_sentence:
+        return (
+            cleaned
+            + "\n\n### 完整收尾\n\n"
+            + "- **先不要把單一訊號當成唯一依據**：請把量化訊號、股價趨勢、回撤風險與新聞情緒一起看。\n"
+            + "- **操作上採保守分批**：若原本想一次進場，建議先降低單次部位，等股價站穩關鍵價位或量能確認後再加碼。\n"
+            + "- **停損要先寫好**：停損點以你的最大可接受虧損為上限；若價格跌破重要支撐或量化訊號轉弱，應優先控風險。\n\n"
+            + "> 本分析僅供研究與決策輔助參考，不構成投資建議。"
+        )
+    return cleaned
 
 
 def _run_analysis(
@@ -632,27 +842,55 @@ def _run_analysis(
 
     final_reply = ""
     dashboard_payload = None
+    analysis_context = None
+    early_handled = False
 
     try:
         with groq_request_context(api_key=api_key, model=model):
-            previous_dashboard = _latest_dashboard(messages[:-1])
+            previous_context = _latest_analysis_context(messages[:-1])
             previous_user_message = _latest_user_message(messages[:-1])
             is_repeat_question = previous_user_message == user_input.strip()
+
+            # Rule-first hard guardrails (run before any follow-up / intent parsing):
+            # 1) Unrelated / small talk: do not attempt stock lookup.
+            if _looks_like_unrelated_local(user_input):
+                final_reply = "請輸入跟台股投資、金融術語或市場分析相關的問題。"
+                yield _event("token", {"text": final_reply})
+                analysis_context = None
+                early_handled = True
+
+            # 2) Financial term only (no ticker/company): always answer the term.
+            # If we have a previous analysis context, we explain the term in that context.
+            if not early_handled and _looks_like_financial_term_only(user_input):
+                yield _event("status", {"text": "辨識為金融術語說明..."})
+                # Term-only questions must be explained as education content.
+                # Do not route them through stock follow-up context, otherwise
+                # simple questions like "MACD 是什麼" can become empty or too narrow.
+                final_reply = yield from _stream_text(
+                    generate_financial_term_answer_stream(user_input, profile.model_dump())
+                )
+                analysis_context = None
+                early_handled = True
+
+            if early_handled:
+                # Fall through to persist the assistant message and emit the done event.
+                raise RuntimeError("__EARLY_HANDLED__")
+
             if (
-                previous_dashboard
-                and (_same_stock_follow_up(user_input, previous_dashboard) or _looks_like_context_follow_up(user_input, previous_dashboard))
+                previous_context
                 and not is_repeat_question
-                and not _looks_like_fresh_analysis(user_input)
+                and _is_context_follow_up(user_input, previous_context)
             ):
                 yield _event("status", {"text": "沿用上一份分析資料回答延伸問題..."})
                 final_reply = yield from _stream_text(
                     generate_follow_up_answer_stream(
                         user_input,
-                        previous_dashboard,
+                        previous_context,
                         [m.model_dump() for m in messages],
-                        user_news_snippet=user_input if _looks_like_context_follow_up(user_input, previous_dashboard) else None,
+                        user_news_snippet=user_input if _looks_like_context_follow_up(user_input, previous_context) else None,
                     )
                 )
+                analysis_context = previous_context
             else:
                 yield _event("status", {"text": "解析投資意圖與標的..."})
                 try:
@@ -671,23 +909,12 @@ def _run_analysis(
                 intent["investor_profile"] = profile.model_dump()
 
                 if intent.get("intent_type") == "UNRELATED":
-                    final_reply = "不好意思，請輸入與投資有關的問題喔！我是專注於台股量化與情緒分析的 AI 投資顧問。"
+                    final_reply = "請輸入跟台股投資、金融術語或市場分析相關的問題。"
                     yield _event("token", {"text": final_reply})
                 elif intent.get("intent_type") == "FINANCIAL_TERM":
-                    # If there is a previous dashboard and the user didn't specify a new target,
-                    # treat this as a term/question follow-up tied to the previous analysis.
-                    if previous_dashboard and not find_stock_mentions(user_input) and not re.search(r"(?<!\\d)\\d{4,6}(?!\\d)", user_input):
-                        yield _event("status", {"text": "沿用上一份分析資料解釋金融術語..."})
-                        final_reply = yield from _stream_text(
-                            generate_follow_up_answer_stream(
-                                user_input,
-                                previous_dashboard,
-                                [m.model_dump() for m in messages],
-                            )
-                        )
-                    else:
-                        yield _event("status", {"text": "辨識為金融術語說明..."})
-                        final_reply = yield from _stream_text(generate_financial_term_answer_stream(user_input, profile.model_dump()))
+                    yield _event("status", {"text": "辨識為金融術語說明..."})
+                    final_reply = yield from _stream_text(generate_financial_term_answer_stream(user_input, profile.model_dump()))
+                    analysis_context = None
                 elif intent.get("intent_type") == "USER_NEWS":
                     yield _event("status", {"text": "分析使用者提供的新聞情緒..."})
                     analysis = analyze_user_provided_news(user_input)
@@ -733,6 +960,14 @@ def _run_analysis(
                         except Exception:
                             analysis_text = ""
                         rec_md = _compare_rank_markdown(rows)
+                        analysis_context = _build_compare_analysis_context(
+                            rows,
+                            stock_mentions[:limit],
+                            profile,
+                            heading,
+                            compared_names,
+                            rec_md,
+                        )
                         if analysis_text:
                             final_reply = f"目前辨識為：{compared_names}\n\n### {heading}\n\n{table_md}\n\n{analysis_text}\n\n{rec_md}".strip()
                         else:
@@ -799,6 +1034,8 @@ def _run_analysis(
                                 "risk": profile.risk_tolerance,
                                 "investor_profile": profile.model_dump(),
                             })
+                            analysis_context = dict(dashboard_payload)
+                            analysis_context["mode"] = "stock"
                             yield _event("dashboard", {"dashboard_data": dashboard_payload})
 
                         yield _event("status", {"text": "[4/4] ✍️ 生成分析報告..."})
@@ -818,11 +1055,27 @@ def _run_analysis(
                             prefix += "\n\n新聞抓取失敗：目前無法取得近期新聞，情緒分數先以 0 處理，量化分析仍會繼續。"
                         final_reply = f"{prefix}\n\n{final_reply}"
 
-        assistant_message = ChatMessage(role="assistant", content=final_reply, dashboard_data=dashboard_payload)
+        assistant_message = ChatMessage(
+            role="assistant",
+            content=final_reply,
+            dashboard_data=dashboard_payload,
+            analysis_context=analysis_context,
+        )
         messages.append(assistant_message)
         _save_state(state)
         yield _event("done", {"message": assistant_message.model_dump()})
     except Exception as exc:
+        if str(exc) == "__EARLY_HANDLED__":
+            assistant_message = ChatMessage(
+                role="assistant",
+                content=final_reply,
+                dashboard_data=dashboard_payload,
+                analysis_context=analysis_context,
+            )
+            messages.append(assistant_message)
+            _save_state(state)
+            yield _event("done", {"message": assistant_message.model_dump()})
+            return
         error_message = _friendly_error_message(exc)
         
         assistant_message = ChatMessage(role="assistant", content=error_message)

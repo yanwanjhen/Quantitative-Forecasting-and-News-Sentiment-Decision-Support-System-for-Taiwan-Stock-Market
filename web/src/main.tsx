@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { createSession, loadSessions, streamMessage, updateProfile } from "./api";
-import type { ChatMessage, ChatSession, DashboardData, InvestorProfile, StreamEvent } from "./types";
+import type { AnalysisContext, ChatMessage, ChatSession, DashboardData, InvestorProfile, StreamEvent } from "./types";
 import "./styles.css";
 
 const riskByStyle: Record<InvestorProfile["style"], InvestorProfile["risk_tolerance"]> = {
@@ -103,7 +103,7 @@ function App() {
             },
           ],
         };
-        setLoadError("無法連線到 FastAPI 後端，請確認 127.0.0.1:8000 正在執行。");
+        setLoadError("無法連線到 FastAPI 後端，請確認後端服務或 VITE_API_BASE_URL 設定。");
         setSessions([fallbackSession]);
         setActiveSessionId(fallbackSession.session_id);
       });
@@ -111,6 +111,26 @@ function App() {
 
   useEffect(() => {
     sessionStorage.setItem("groq-api-key", apiKey);
+  }, [apiKey]);
+
+  // If a valid API key is already present (e.g. restored from sessionStorage),
+  // don't keep showing stale "please enter API key" style banners.
+  useEffect(() => {
+    const trimmed = apiKey.trim();
+    if (!trimmed) return;
+    if (!/^gsk_[A-Za-z0-9_-]{8,}$/.test(trimmed)) return;
+    // Only clear banners that are related to API-key entry/format.
+    if (/API Key/.test(loadError)) {
+      setLoadError("");
+    }
+    // Ensure hint reflects that we do have a key stored.
+    if (apiKeyCheck.state === "idle") {
+      setApiKeyCheck({
+        state: "ok",
+        message: "API Key 已暫存於本機（本次瀏覽器 session）。送出訊息時會以 X-Groq-API-Key 隨請求送到後端。",
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiKey]);
 
   useEffect(() => {
@@ -153,6 +173,10 @@ function App() {
       setApiKeyCheck({ state: "warn", message: "API Key 格式錯誤，請確認是否貼上完整。" });
       return;
     }
+    // A valid key is present; clear any stale "missing/invalid API key" banner text.
+    if (/API Key/.test(loadError)) {
+      setLoadError("");
+    }
     setApiKeyCheck({
       state: "ok",
       message: "API Key 已暫存於本機（本次瀏覽器 session）。送出訊息時會以 X-Groq-API-Key 隨請求送到後端。",
@@ -170,7 +194,9 @@ function App() {
       setActiveSessionId(created.session_id);
     } catch {
       const sessionId = `local-${crypto.randomUUID()}`;
-      setLoadError("無法建立後端對話，已先開啟本機暫存對話。");
+      // Creating a backend session is nice-to-have; we can still continue locally.
+      // Don't block the UI with a red banner for this.
+      showToast("無法建立後端對話，已先開啟本機暫存對話。", "warn");
       setSessions((current) => [
         ...current,
         {
@@ -205,9 +231,16 @@ function App() {
     event?.preventDefault();
     const content = (override ?? draft).trim();
     if (!content || isStreaming) return;
-    if (!apiKey.trim()) {
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) {
       setLoadError("尚未輸入 API Key，請先在左側欄 API Key 面板輸入。");
       setApiKeyPanelOpen(true);
+      return;
+    }
+    if (!/^gsk_[A-Za-z0-9_-]{8,}$/.test(trimmedKey)) {
+      setLoadError("API Key 格式錯誤，請確認是否貼上完整。");
+      setApiKeyPanelOpen(true);
+      setApiKeyCheck({ state: "warn", message: "API Key 格式錯誤，請確認是否貼上完整。" });
       return;
     }
     setFollowUps([]);
@@ -385,6 +418,7 @@ function App() {
               const completedMs = Date.now() - requestStarted;
               setIsStreaming(false);
               liveAssistant = { ...liveAssistant, content: streamEvent.data.message };
+              setFollowUps([]);
               setSessions((current) =>
                 current.map((session) => {
                   if (session.session_id !== targetSessionId) return session;
@@ -553,7 +587,13 @@ function App() {
                   <KeyRound size={17} />
                   <input
                     value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
+                    onChange={(event) => {
+                      setApiKey(event.target.value);
+                      // Clear stale banner once user starts editing.
+                      if (loadError) setLoadError("");
+                      setApiKeyCheck({ state: "idle" });
+                    }}
+                    onBlur={runApiKeyCheck}
                     type={apiKeyVisible ? "text" : "password"}
                     placeholder="gsk_..."
                   />
@@ -567,6 +607,11 @@ function App() {
                   </button>
                 </div>
               </label>
+              {apiKeyCheck.state !== "idle" && (
+                <div className={`api-key-hint ${apiKeyCheck.state === "ok" ? "ok" : "warn"}`}>
+                  {apiKeyCheck.message}
+                </div>
+              )}
             </section>
           )}
         </div>
@@ -996,116 +1041,56 @@ function Metric({ label, value }: { label: string; value: string }) {
 }
 
 function buildFollowUps(messages: ChatMessage[]) {
-  if (messages.length <= 1) {
-    return [
-      "台積電目前的量化訊號與走勢如何？",
-      "可以幫我分析長榮與陽明的差異嗎？",
-      "最近大盤的市場情緒是偏多還是偏空？"
-    ];
+  const hasUserMessage = messages.some((m) => m.role === "user" && m.content.trim());
+  if (!hasUserMessage) {
+    return [];
   }
+  const STOCK_POOL: Array<{ name: string; ticker: string }> = [
+    { name: "台積電", ticker: "2330" },
+    { name: "聯發科", ticker: "2454" },
+    { name: "鴻海", ticker: "2317" },
+    { name: "國巨", ticker: "2327" },
+    { name: "長榮", ticker: "2603" },
+    { name: "陽明", ticker: "2609" },
+    { name: "世界", ticker: "5347" },
+    { name: "廣達", ticker: "2382" },
+    { name: "緯創", ticker: "3231" },
+    { name: "華邦電", ticker: "2344" },
+    { name: "金寶", ticker: "2312" },
+    { name: "立積", ticker: "4968" },
+  ];
 
-  const lastUserMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
-  const lastDashboard = [...messages].reverse().find((message) => message.dashboard_data)?.dashboard_data;
-  const compareTargets = extractComparisonTargets(lastUserMsg);
+  const pick = (exclude: Set<string> = new Set()) => {
+    const candidates = STOCK_POOL.filter((s) => !exclude.has(s.ticker));
+    const chosen = candidates[Math.floor(Math.random() * candidates.length)] || STOCK_POOL[0];
+    return chosen;
+  };
 
-  if (compareTargets.length >= 2) {
-    const [first, second] = compareTargets;
-    const group = compareTargets.slice(0, 5).join("、");
-    return [
-      `${group} 當中哪一檔最不適合追高？`,
-      `${first} 和 ${second} 如果只能選一檔，現階段我該優先哪一檔？`,
-      `${group} 如果大盤轉弱，部位該怎麼分配？`
-    ];
-  }
-  
-  if (!lastDashboard) {
-    if (FINANCIAL_TERMS.some((kw) => lastUserMsg.includes(kw))) {
-      return [
-        "這個指標如果和量化訊號衝突，應該優先看哪一個？",
-        "這個指標最容易誤判的情境是什麼？",
-        "如果我偏保守，該怎麼把這個指標放進進出場規則？"
-      ];
-    } else if (["如果", "假設", "情境", "套牢", "風險承受", "停損順序"].some((kw) => lastUserMsg.includes(kw))) {
-      return [
-        "如果大盤再跌 5%，我應該先調整哪一種部位？",
-        "以穩健風格來看，這種情境最重要的防守規則是什麼？",
-        "如果想等反彈再處理，至少要先看到哪些訊號？"
-      ];
-    } else if (["比較", "哪個", "選", "vs"].some(kw => lastUserMsg.includes(kw))) {
-      return [
-        "如果資金有限，這幾檔股票應該優先佈局哪一檔？",
-        "這幾檔標的中，哪一檔的下檔風險（回撤）相對可控？",
-        "這幾檔股票的近期法人籌碼動向如何？"
-      ];
-    } else if (["新聞", "網址", "http"].some(kw => lastUserMsg.includes(kw))) {
-      return [
-        "這則新聞對股價的影響會是短線波動還是長線趨勢？",
-        "如果因為這則新聞而進場，停損點應該設在哪？",
-        "為什麼情緒分數會偏多/偏空？主要是哪幾則新聞在拉動？"
-      ];
-    } else {
-      return [
-        "目前這幾檔股票，哪一檔的量化訊號最明確？",
-        "如果大盤接下來轉弱，這些持股該怎麼調整比例？",
-        "可以幫我詳細評估其中最危險的那檔股票嗎？"
-      ];
-    }
-  }
+  const a = pick();
+  const b = pick(new Set([a.ticker]));
+  const c = pick(new Set([a.ticker, b.ticker]));
+  const A = `${a.name}（${a.ticker}）`;
+  const B = `${b.name}（${b.ticker}）`;
+  const C = `${c.name}（${c.ticker}）`;
 
-  const company = `${lastDashboard.company_name}（${lastDashboard.ticker}）`;
-  const signal = lastDashboard.quant_data?.signal || "觀望";
-  const trend = lastDashboard.stock_data?.trend_summary || "目前趨勢";
+  const templates = [
+    () => `請用「一句話結論 / 主要理由 / 可執行操作」三段回答：${A} 目前適合分批進場嗎？`,
+    () => `請給我可執行的停損規則（價位/條件/例外）：${A} 如果跌破月線，停損可以怎麼設？`,
+    () => `請用白話解讀，並點出最重要的 2 個風險：${A} 的量化訊號和回撤（Max DD）該怎麼看？`,
+    () => `請直接選 1 檔並說明原因：${A} 和 ${B} 如果只能選一檔，現階段我該優先哪一檔？`,
+    () => `請列出 2 個不適合追高的理由：${A}、${B}、${C} 當中哪一檔最不適合追高？`,
+    () => `請給我一個保守配置比例（用百分比）：${A} 如果大盤轉弱，部位該怎麼分配？`,
+  ];
 
-  if (["風險", "最大風險", "跌", "停損"].some(kw => lastUserMsg.includes(kw))) {
-    return [
-      `${company} 如果跌破月線，停損要設在哪裡？`,
-      `${company} 目前最需要觀察哪個風險訊號？`,
-      `${company} 如果新聞轉空，我應該怎麼調整部位？`
-    ];
-  } else if (["續抱", "減碼", "停利"].some(kw => lastUserMsg.includes(kw))) {
-    return [
-      `${company} 目前續抱需要看哪三個條件？`,
-      `${company} 如果要分批減碼，該看哪些訊號？`,
-      `${company} 如果想提高勝率，應該等什麼確認訊號？`
-    ];
-  } else if (["進場", "買", "買入", "加碼"].some(kw => lastUserMsg.includes(kw))) {
-    return [
-      `${company} 現在適合一次買還是分批買？`,
-      `${company} 進場前需要等哪些確認訊號？`,
-      `${company} 如果量化買入但情緒偏弱怎麼辦？`
-    ];
-  } else {
-    return [
-      `${company} 的 ${signal} 訊號可以怎麼設定進出場？`,
-      `${company} 在${trend}的情況下，接下來最大風險是什麼？`,
-      `${company} 的建議可信度主要受哪些資料影響？`
-    ];
+  const results: string[] = [];
+  const used = new Set<number>();
+  while (results.length < 3 && used.size < templates.length) {
+    const idx = Math.floor(Math.random() * templates.length);
+    if (used.has(idx)) continue;
+    used.add(idx);
+    results.push(templates[idx]());
   }
-}
-
-function extractComparisonTargets(text: string) {
-  const targets: string[] = [];
-  const seen = new Set<string>();
-  for (const match of text.matchAll(/([\u4e00-\u9fffA-Za-z\-]{1,12})\s*[（(](\d{4,6})[)）]/g)) {
-    const label = `${match[1]}（${match[2]}）`;
-    if (!seen.has(label)) {
-      seen.add(label);
-      targets.push(label);
-    }
-  }
-  for (const match of text.matchAll(/[（(]([\u4e00-\u9fffA-Za-z、，,\s]{2,40})[)）]/g)) {
-    const parts = match[1]
-      .split(/[、，,\s]+/)
-      .map((part) => part.trim())
-      .filter((part) => /^[\u4e00-\u9fffA-Za-z-]{2,12}$/.test(part));
-    for (const part of parts) {
-      if (!seen.has(part)) {
-        seen.add(part);
-        targets.push(part);
-      }
-    }
-  }
-  return targets;
+  return results;
 }
 
 async function copyMessageContent(content: string) {
@@ -1115,8 +1100,6 @@ async function copyMessageContent(content: string) {
   }
   await navigator.clipboard.writeText(fallback);
 }
-
-const FINANCIAL_TERMS = ["EPS", "本益比", "PER", "PE", "P/E", "殖利率", "MACD", "KD", "RSI", "ROE", "ROA", "最大回撤"];
 
 function formatElapsed(ms: number) {
   const totalSeconds = Math.max(0, ms) / 1000;

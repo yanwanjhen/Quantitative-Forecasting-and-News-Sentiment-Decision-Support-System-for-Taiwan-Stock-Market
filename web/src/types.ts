@@ -17,12 +17,22 @@ export interface DashboardData {
   investor_profile: InvestorProfile;
 }
 
+export interface AnalysisContext extends Partial<DashboardData> {
+  mode?: "stock" | "compare";
+  heading?: string;
+  compared_names?: string;
+  stocks?: Array<{ ticker?: string; company_name?: string }>;
+  compare_rows?: Array<Record<string, unknown>>;
+  recommendation?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: Role;
   content: string;
   created_at: number;
   dashboard_data?: DashboardData | null;
+  analysis_context?: AnalysisContext | null;
 }
 
 export interface ChatSession {

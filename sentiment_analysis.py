@@ -253,8 +253,8 @@ def get_finbert_continuous_score(text, target_company=None):
     else:
         # Case B: 模型已有明確多空看法 (Pos/Neg) -> 「模型」權重調高
         # 關鍵字僅作輔助，避免誤導
-        w_model = 0.75
-        w_keyword = 0.25
+        w_model = 0.7
+        w_keyword = 0.3
         
     # 3. 融合計算
     final_score = (base_score * w_model) + (keyword_score * w_keyword)
